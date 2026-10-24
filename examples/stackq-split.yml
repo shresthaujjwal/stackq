@@ -1,6 +1,11 @@
-# Copy to .github/workflows/stackq-split.yml. Run it from the Actions tab with
-# the name of the big branch: it splits the branch into a stack and opens the
-# stacked PRs, so nobody needs a local token or gh login.
+# Copy to .github/workflows/stackq-split.yml.
+#
+# Label a big PR `stackq:split` and this splits its branch into a stack of
+# small PRs, links them from the original PR, closes the original, and removes
+# the label. You can also run it by hand from the Actions tab with a branch name.
+# Nobody needs a local token or gh login.
+#
+# Create the label once (Issues > Labels > New label: stackq:split).
 #
 # Token: add a STACKQ_TOKEN secret (fine-grained PAT or App token with contents
 # and pull-requests write) at the repo or org level. Without it the workflow
@@ -8,9 +13,13 @@
 #   Settings > Actions > General > "Allow GitHub Actions to create and approve
 #   pull requests"
 # and does not trigger CI on the pushed branches (the last step starts it).
+#
+# PRs from forks are ignored: they get a read-only token.
 name: stackq split
 
 on:
+  pull_request:
+    types: [labeled]
   workflow_dispatch:
     inputs:
       branch:
@@ -44,13 +53,21 @@ concurrency:
 
 jobs:
   split:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.label.name == 'stackq:split' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       !startsWith(github.event.pull_request.head.ref, 'stack/'))
     runs-on: ubuntu-latest
     env:
       TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
+      BRANCH: ${{ inputs.branch || github.event.pull_request.head.ref }}
+      # 0 when started by hand: stackq then looks up the branch's open PR.
+      SOURCE_PR: ${{ github.event.pull_request.number || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.branch }}
+          ref: ${{ env.BRANCH }}
           fetch-depth: 0 # the planner needs the merge base and history
           token: ${{ env.TOKEN }}
 
@@ -60,14 +77,14 @@ jobs:
         with:
           token: ${{ env.TOKEN }}
           command: split
-          args: --max-lines ${{ inputs.max_lines }} ${{ inputs.force && '--force' || '' }}
+          args: --max-lines ${{ inputs.max_lines || '400' }} --from-pr ${{ env.SOURCE_PR }} ${{ inputs.force && '--force' || '' }}
 
       - name: Push and open the PRs
         uses: YOUR_ORG/stackq@v0
         with:
           token: ${{ env.TOKEN }}
           command: push
-          args: ${{ inputs.draft && '--draft' || '' }} ${{ inputs.close_source && '--close-source' || '' }}
+          args: --from-pr ${{ env.SOURCE_PR }} ${{ inputs.draft && '--draft' || '' }} ${{ (github.event_name == 'pull_request' || inputs.close_source) && '--close-source' || '' }}
 
       # Pushes made with the built-in token do not start pull_request
       # workflows. Harmless when a PAT or App token is used.
@@ -79,3 +96,20 @@ jobs:
           while read -r branch; do
             gh workflow run ci.yml --ref "$branch" || true
           done
+
+      # Take the label off so applying it again retries.
+      - name: Remove the label
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ env.TOKEN }}
+        run: gh pr edit "$SOURCE_PR" --remove-label stackq:split || true
+
+      - name: Say so on the PR if it failed
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ env.TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh pr comment "$SOURCE_PR" --body "stackq could not split this PR. See the run: $RUN_URL
+
+          Fix the cause and add the \`stackq:split\` label again. If a stack of this name already exists, run the \`stackq split\` workflow by hand with *force* ticked."

@@ -149,7 +149,7 @@ If the big branch already has an open PR, `stackq push` finds it (or pass `--fro
 3. **stackq workflow.** Copy `examples/stackq.yml` to `.github/workflows/`, and point `uses:` at wherever you host this repo.
 4. **Token.** Give the workflow a GitHub App token or a fine-grained PAT with contents and pull-requests write access. Pushes made with the default `GITHUB_TOKEN` don't trigger other workflows, so a restacked PR would never get its checks.
 
-To open a stack from the Actions tab instead of a laptop, copy `examples/stackq-split.yml` and run it with the branch name. It uses a `STACKQ_TOKEN` secret if you set one, and the built-in token otherwise (then enable "Allow GitHub Actions to create and approve pull requests").
+To split from GitHub instead of a laptop, copy `examples/stackq-split.yml`. Label a big PR `stackq:split` (create the label once) and the Action splits its branch, opens the stacked PRs, links them from the original PR, closes it, and removes the label. You can also run the workflow by hand with a branch name. It uses a `STACKQ_TOKEN` secret if you set one, and the built-in token otherwise (then enable "Allow GitHub Actions to create and approve pull requests"). PRs from forks are ignored.
 
 Manual controls, through workflow_dispatch or locally:
 
