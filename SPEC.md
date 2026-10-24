@@ -723,11 +723,20 @@ Inputs:
 - `args`: extra arguments for the command, passed through the environment variable `STACKQ_ARGS` to avoid expression injection. They are split on spaces and quotes are not interpreted, so put anything with spaces (such as `check`) in `.stackq.json`.
 
 Steps:
-1. `actions/setup-go@v5` with Go stable and no cache.
-2. `go build -o $RUNNER_TEMP/stackq ./cmd/stackq`, built from the action's own path.
+1. `actions/setup-go@v5` with Go stable and no cache (the repo's own build checks need a toolchain).
+2. Get the binary. The `version` input (default `latest`) picks a release; when the workflow pins the action to a tag like `@v0.3.1` and the input is `latest`, that exact release is used. The step downloads `stackq_<os>_<arch>` and `checksums.txt` from the release, verifies the SHA-256, and runs `stackq version`. If the download or the checksum fails, or `version` is `source`, it builds from the action's own path instead (`go build -o $RUNNER_TEMP/stackq ./cmd/stackq`) and prints a warning.
 3. Set git `user.name` and `user.email` if they're unset, then run `stackq $STACKQ_COMMAND $STACKQ_ARGS` with `GH_TOKEN` set.
 
-Build time is a few seconds, since there are no dependencies. A future improvement is publishing release binaries and downloading them (§26).
+Releases are produced by `.github/workflows/release.yml` (§15.5).
+
+### 15.5 Releases (`.github/workflows/release.yml`)
+
+Every push to `main` (a merged PR) is tested (`gofmt`, `go vet`, `go test -race`), versioned, built and released:
+- **Version:** the next patch after the latest `vX.Y.Z` tag (`v0.1.0` for the first release). `[minor]` or `[major]` anywhere in a commit message since the last tag, such as a PR title in the merge commit, bumps that part instead. A commit that already has a tag is skipped.
+- **Binaries:** `stackq_linux_amd64`, `stackq_linux_arm64`, `stackq_darwin_amd64`, `stackq_darwin_arm64`, `stackq_windows_amd64.exe` and `checksums.txt`, built with `CGO_ENABLED=0`, `-trimpath` and `-X main.version/main.commit`. The names carry no version, so `releases/latest/download/<name>` is a stable URL. The build fails unless `stackq version` reports the tag it is about to release.
+- **Release:** `gh release create` with generated notes, using `GITHUB_TOKEN` (`contents: write`).
+- **Major tag:** `v0` (or `v1`, ...) is moved to the new release, so `uses: OWNER/stackq@v0` follows the latest compatible release.
+- **Concurrency:** one release at a time. If several PRs merge while a release runs, only the newest waiting run starts, and it releases everything merged so far. Those earlier merges share its version.
 
 ### 15.2 Workflow (`examples/stackq.yml`)
 
@@ -1088,7 +1097,7 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
 - **G4. No recovery for lost local state.** A `stackq adopt` command could rebuild the JSON from PR markers.
 - **G5. No `stackq abandon`, `stackq reorder` or `stackq insert`** for adding a slice mid-stack.
 - **G6. No progress output for large plans, and no `git cat-file --batch` optimization.**
-- **G7. Release pipeline.** The Action builds from source every run.
+- **G7. (Done, §15.5.)** Release pipeline: the Action downloads a verified release binary and builds from source only as a fallback.
 
 ---
 
@@ -1127,7 +1136,7 @@ Ordered by value to you.
    - Add a `STACKQ_E2E_REPO` env-gated integration test that runs against the sandbox.
 2. **Fix K1:** make the conflict comment and the sync behavior agree. Add `stackq sync --stop` and `stackq continue`.
 3. **Change the module path** to `github.com/<you>/stackq` and tag `v0.1.0` (§32.3).
-4. **Release binaries** with goreleaser. Have the Action download them by tag instead of building (G7).
+4. ~~Release binaries.~~ Done (§15.5): a release workflow publishes binaries and the Action downloads them.
 
 ### P0.5: atomic and flag hardening (from §28–§30)
 

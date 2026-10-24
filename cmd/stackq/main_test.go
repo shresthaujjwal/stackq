@@ -45,3 +45,16 @@ func TestFromEventKeepsTheMergeAndDequeueMappings(t *testing.T) {
 		t.Errorf("dispatch tick: got %q, %v", sub, err)
 	}
 }
+
+func TestVersionString(t *testing.T) {
+	oldV, oldC := version, commit
+	defer func() { version, commit = oldV, oldC }()
+	version, commit = "dev", ""
+	if got := versionString(); got != "stackq dev" {
+		t.Errorf("dev build: %q", got)
+	}
+	version, commit = "v1.2.3", "abc1234"
+	if got := versionString(); got != "stackq v1.2.3 (abc1234)" {
+		t.Errorf("release build: %q", got)
+	}
+}
