@@ -748,8 +748,10 @@ Build time is a few seconds, since there are no dependencies. A future improveme
 |---|---|---|
 | `pull_request` / `pull_request_target` | `action == closed && pull_request.merged` | `after-merge` |
 | same | `action == dequeued` | `dequeued` |
+| same | `action == labeled` with the pool label | `schedule` |
 | same | anything else | no-op, exit 0 |
-| `workflow_dispatch` | `inputs.command` (default `land`), `inputs.pr` (may start with `#`) | that command |
+| `pull_request_review`, `workflow_run`, `check_suite`, `schedule` | `autoLand` or the priority pool is on | `tick` (otherwise no-op) |
+| `workflow_dispatch` | `inputs.command` (default `land`; `schedule` and `tick` need no PR), `inputs.pr` (may start with `#`) | that command |
 | anything else | n/a | no-op |
 
 You can also call the steps directly: `stackq ci after-merge|dequeued|land --pr N [--no-enqueue]`.
@@ -912,6 +914,8 @@ Exit codes: 0 for success, 1 for any error (message on stderr prefixed `stackq:`
 | `priority.classes` | `[{name, weight, jump, match}]` | §31.3 | Ordered classes; `match` has `labels`, `authors`, `branches`, `titleRegex`, `bodyRegex`, `reverts`, `maxLines`, `maxFiles` |
 
 Precedence: flags, then config, then built-in defaults.
+
+`autoLand` (bool, default false): in atomic mode, land a stack by itself once every part is approved and green. `stackq ci tick` runs on each review, finished CI run and timer tick. It lands every open atomic stack that passes the same gates as `stackq land`, and leaves the others alone without a comment, a label or an error. A stack whose lander already targets trunk (or is in the queue) is skipped, so repeated events queue it once. If the enqueue itself failed after the retarget, run `stackq land` by hand. Pool PRs get their normal priority pass in the same tick.
 
 ---
 

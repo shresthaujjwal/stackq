@@ -450,3 +450,56 @@ func TestIncrementalStackLeavesActivationForHumans(t *testing.T) {
 		t.Fatalf("original PR not told about the waiting activation: %q", cs)
 	}
 }
+
+func TestAutoLandWaitsQuietlyThenLandsOnce(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	lander, part2 := prBy(t, fx, 2), prBy(t, fx, 1)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+
+	quiet := func(why string) {
+		t.Helper()
+		if err := run.AutoLand(); err != nil {
+			t.Fatalf("%s: auto-land must not fail while waiting: %v", why, err)
+		}
+		if len(fx.f.Enqueued) != 0 || prBy(t, fx, 2).BaseRef == "main" {
+			t.Fatalf("%s: stack was queued", why)
+		}
+		if len(fx.f.Comments[lander.Number]) != 0 || fx.f.Labels[lander.Number][land.LabelBlocked] {
+			t.Fatalf("%s: waiting must not comment or label: %q %v", why, fx.f.Comments[lander.Number], fx.f.Labels[lander.Number])
+		}
+	}
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Approvals = nil })
+	quiet("missing approval")
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Approvals = []string{"ana"}; d.Checks = "pending" })
+	quiet("checks running")
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "failure" })
+	quiet("checks failing")
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "success" })
+
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
+	}
+	if lp := prBy(t, fx, 2); lp.BaseRef != "main" || len(fx.f.Enqueued) != 1 || fx.f.Enqueued[0] != lp.Number {
+		t.Fatalf("ready stack not queued as one entry: base=%s queued=%v", lp.BaseRef, fx.f.Enqueued)
+	}
+	comments := len(fx.f.Comments[lander.Number])
+
+	// The next approval, CI run or timer tick must not queue it again.
+	for i := 0; i < 3; i++ {
+		if err := run.AutoLand(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(fx.f.Enqueued) != 1 || len(fx.f.Comments[lander.Number]) != comments {
+		t.Fatalf("landing repeated: queued=%v comments=%d (was %d)", fx.f.Enqueued, len(fx.f.Comments[lander.Number]), comments)
+	}
+}
+
+func TestAutoLandIgnoresIncrementalStacksAndForeignPRs(t *testing.T) {
+	fx := setup(t) // incremental stack
+	fx.f.CreatePR("someone/else", "main", "unrelated", "no marker here", false)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := run.AutoLand(); err != nil || len(fx.f.Enqueued) != 0 {
+		t.Fatalf("incremental stacks and plain PRs are not auto-landed: %v %v", err, fx.f.Enqueued)
+	}
+}

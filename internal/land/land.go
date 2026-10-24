@@ -162,7 +162,57 @@ func (c *Runner) Land(n int) error {
 
 // landAtomic gates every part, retargets the lander to trunk and queues it
 // as one entry carrying the whole stack.
-func (c *Runner) landAtomic(m stack.Marker) error {
+func (c *Runner) landAtomic(m stack.Marker) error { return c.attemptAtomic(m, false) }
+
+// AutoLand lands every open atomic stack whose parts are all approved and
+// green, and that isn't landing already. It is meant to run on every approval,
+// finished CI run and timer tick, so a stack that isn't ready is left alone
+// without a comment, a label or an error.
+func (c *Runner) AutoLand() error {
+	open, err := c.Forge.ListPRs("open")
+	if err != nil {
+		return err
+	}
+	byName := map[string]stack.Marker{}
+	var names []string
+	for _, p := range open {
+		m, ok := stack.ParseMarker(p.Body)
+		if !ok || !m.Atomic() {
+			continue
+		}
+		if _, dup := byName[m.Stack]; !dup {
+			byName[m.Stack] = m
+			names = append(names, m.Stack)
+		}
+	}
+	sort.Strings(names)
+	var errs []error
+	for _, name := range names {
+		if err := c.attemptAtomic(byName[name], true); err != nil {
+			errs = append(errs, fmt.Errorf("stack %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// queued reports whether GitHub's queue for trunk already holds PR n.
+func (c *Runner) queued(n int, trunk string) bool {
+	q, err := c.Forge.Queue(trunk)
+	if err != nil {
+		return false
+	}
+	for _, e := range q {
+		if e.PR == n {
+			return true
+		}
+	}
+	return false
+}
+
+// attemptAtomic gates and queues an atomic stack. With auto set it is quiet:
+// anything that stops the landing is logged and returns nil, because the next
+// event will try again.
+func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 	sp, err := c.loadStack(m.Stack)
 	if err != nil {
 		return err
@@ -175,13 +225,26 @@ func (c *Runner) landAtomic(m stack.Marker) error {
 		case p.Open():
 			parts = append(parts, p)
 		case p.State == "CLOSED":
-			return fmt.Errorf("#%d (part %d) was closed without merging; reopen it or rebuild the stack", p.Number, pm.Index)
+			err := fmt.Errorf("#%d (part %d) was closed without merging; reopen it or rebuild the stack", p.Number, pm.Index)
+			if auto {
+				c.logf("- stack %s: %v", m.Stack, err)
+				return nil
+			}
+			return err
 		}
 	}
 	if len(parts) == 0 {
+		if auto {
+			return nil
+		}
 		return fmt.Errorf("stack %s has nothing left to land", m.Stack)
 	}
 	lander := parts[len(parts)-1]
+	// Once the lander targets trunk the stack is landing; don't queue it twice.
+	if auto && lander.BaseRef == m.Trunk && (len(parts) > 1 || c.queued(lander.Number, m.Trunk)) {
+		c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
+		return nil
+	}
 
 	fetch := []string{"fetch", "--quiet", c.Remote, "+refs/heads/" + m.Trunk + ":refs/remotes/" + c.remoteRef(m.Trunk)}
 	for _, p := range parts {
@@ -232,6 +295,10 @@ func (c *Runner) landAtomic(m stack.Marker) error {
 			approvers = "—"
 		}
 		rows = append(rows, row{p, approvers, d.Checks})
+	}
+	if len(problems) > 0 && auto {
+		c.logf("- stack %s is not ready to land: %s", m.Stack, strings.Join(problems, "; "))
+		return nil
 	}
 	if len(problems) > 0 {
 		msg := "stack " + m.Stack + " is not ready to land:\n  - " + strings.Join(problems, "\n  - ")
