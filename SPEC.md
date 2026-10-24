@@ -899,6 +899,7 @@ Exit codes: 0 for success, 1 for any error (message on stderr prefixed `stackq:`
 | `slices` | `[{name, paths[]}]` | none | Pinned, ordered rules (§9.2, §9.5) |
 | `landing` | string | `atomic` | `atomic` or `incremental` (§28) |
 | `minApprovals` | int | 1 | Approvals each part needs before an atomic landing |
+| `allowUnreviewed` | bool | false | Skip the approval gate for atomic landings, from CI and `land`. Checks, requested changes and stacking are still enforced. For repos that cannot get a second reviewer (sandboxes); GitHub's own branch rules still apply |
 | `keepBranches` | bool | false | Keep part branches after an atomic landing |
 | `flags.paths` | `[]glob` | none | Flag definitions; land first (§29) |
 | `flags.activation` | `[]glob` | none | Files that turn features on; held in a hand-merged PR |

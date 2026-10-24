@@ -503,3 +503,25 @@ func TestAutoLandIgnoresIncrementalStacksAndForeignPRs(t *testing.T) {
 		t.Fatalf("incremental stacks and plain PRs are not auto-landed: %v %v", err, fx.f.Enqueued)
 	}
 }
+
+func TestAutoLandWithoutApprovalsWhenAllowed(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	for i := 0; i < 3; i++ {
+		fx.f.SetDetails(prBy(t, fx, i).Number, func(d *forge.Details) { d.Approvals = nil })
+	}
+	strict := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := strict.AutoLand(); err != nil || len(fx.f.Enqueued) != 0 {
+		t.Fatalf("unreviewed stack must wait by default: %v %v", err, fx.f.Enqueued)
+	}
+	lax := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", AllowUnreviewed: true}
+	if err := lax.AutoLand(); err != nil || len(fx.f.Enqueued) != 1 {
+		t.Fatalf("allowUnreviewed should land it: %v %v", err, fx.f.Enqueued)
+	}
+	// Still gated on checks.
+	fx2 := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	fx2.f.SetDetails(prBy(t, fx2, 1).Number, func(d *forge.Details) { d.Approvals = nil; d.Checks = "failure" })
+	lax2 := &land.Runner{Repo: fx2.dev, Forge: fx2.f, Remote: "origin", AllowUnreviewed: true}
+	if err := lax2.AutoLand(); err != nil || len(fx2.f.Enqueued) != 0 {
+		t.Fatalf("red checks must still block: %v %v", err, fx2.f.Enqueued)
+	}
+}
