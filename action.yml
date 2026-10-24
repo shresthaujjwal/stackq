@@ -11,8 +11,18 @@ inputs:
       token or a PAT: pushes made with GITHUB_TOKEN do not trigger your CI, so
       a restacked PR would never get the checks the queue needs.
     required: true
+  command:
+    description: >
+      The stackq command to run: `ci` (the default; reads the GitHub event),
+      or `split`, `push`, `sync`, `status`, `land`, `revert`, `schedule`.
+      For anything but `ci`, check out the branch you want to act on first,
+      with `fetch-depth: 0`.
+    required: false
+    default: ci
   args:
-    description: Extra arguments for `stackq ci`, e.g. `--no-enqueue`.
+    description: >
+      Extra arguments for the command, split on spaces (quotes are not
+      interpreted), e.g. `--no-enqueue` for `ci` or `--max-lines 300` for `split`.
     required: false
     default: ""
 
@@ -33,9 +43,10 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
+        STACKQ_COMMAND: ${{ inputs.command }}
         STACKQ_ARGS: ${{ inputs.args }}
       run: |
         git config user.name  >/dev/null || git config user.name  "stackq[bot]"
         git config user.email >/dev/null || git config user.email "stackq-bot@users.noreply.github.com"
         # shellcheck disable=SC2086
-        "$RUNNER_TEMP/stackq" ci $STACKQ_ARGS
+        "$RUNNER_TEMP/stackq" $STACKQ_COMMAND $STACKQ_ARGS

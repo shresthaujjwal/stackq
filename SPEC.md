@@ -719,12 +719,13 @@ Incremental landing costs one queue cycle per slice. Atomic landing costs one qu
 
 Inputs:
 - `token` (required): an App token or PAT.
-- `args`: extra flags for `stackq ci`, passed through the environment variable `STACKQ_ARGS` to avoid expression injection.
+- `command` (default `ci`): the stackq command to run. `ci` reads the GitHub event; `split`, `push`, `sync`, `status`, `land`, `revert` and `schedule` act on the branch the workflow checked out (use `fetch-depth: 0`). See `examples/stackq-split.yml`.
+- `args`: extra arguments for the command, passed through the environment variable `STACKQ_ARGS` to avoid expression injection. They are split on spaces and quotes are not interpreted, so put anything with spaces (such as `check`) in `.stackq.json`.
 
 Steps:
 1. `actions/setup-go@v5` with Go stable and no cache.
 2. `go build -o $RUNNER_TEMP/stackq ./cmd/stackq`, built from the action's own path.
-3. Set git `user.name` and `user.email` if they're unset, then run `stackq ci $STACKQ_ARGS` with `GH_TOKEN` set.
+3. Set git `user.name` and `user.email` if they're unset, then run `stackq $STACKQ_COMMAND $STACKQ_ARGS` with `GH_TOKEN` set.
 
 Build time is a few seconds, since there are no dependencies. A future improvement is publishing release binaries and downloading them (§26).
 

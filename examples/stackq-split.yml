@@ -1,0 +1,81 @@
+# Copy to .github/workflows/stackq-split.yml. Run it from the Actions tab with
+# the name of the big branch: it splits the branch into a stack and opens the
+# stacked PRs, so nobody needs a local token or gh login.
+#
+# Token: add a STACKQ_TOKEN secret (fine-grained PAT or App token with contents
+# and pull-requests write) at the repo or org level. Without it the workflow
+# falls back to the built-in token, which needs
+#   Settings > Actions > General > "Allow GitHub Actions to create and approve
+#   pull requests"
+# and does not trigger CI on the pushed branches (the last step starts it).
+name: stackq split
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to split into a stack
+        required: true
+      max_lines:
+        description: Changed-line budget per slice
+        default: "400"
+      draft:
+        description: Open the PRs as drafts
+        type: boolean
+        default: false
+      close_source:
+        description: Close the original PR once the stack exists
+        type: boolean
+        default: true
+      force:
+        description: Replace an existing stack of the same name
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+# Share stackq's group so a split never overlaps a restack.
+concurrency:
+  group: stackq
+  cancel-in-progress: false
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0 # the planner needs the merge base and history
+          token: ${{ env.TOKEN }}
+
+      # The slice build check comes from "check" in .stackq.json.
+      - name: Split
+        uses: YOUR_ORG/stackq@v0
+        with:
+          token: ${{ env.TOKEN }}
+          command: split
+          args: --max-lines ${{ inputs.max_lines }} ${{ inputs.force && '--force' || '' }}
+
+      - name: Push and open the PRs
+        uses: YOUR_ORG/stackq@v0
+        with:
+          token: ${{ env.TOKEN }}
+          command: push
+          args: ${{ inputs.draft && '--draft' || '' }} ${{ inputs.close_source && '--close-source' || '' }}
+
+      # Pushes made with the built-in token do not start pull_request
+      # workflows. Harmless when a PAT or App token is used.
+      - name: Start CI on the stack branches
+        env:
+          GH_TOKEN: ${{ env.TOKEN }}
+        run: |
+          gh pr list --state open --json headRefName --jq '.[].headRefName | select(startswith("stack/"))' |
+          while read -r branch; do
+            gh workflow run ci.yml --ref "$branch" || true
+          done
