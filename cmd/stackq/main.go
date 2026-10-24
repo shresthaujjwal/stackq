@@ -106,14 +106,17 @@ type config struct {
 	KeepBranches bool   `json:"keepBranches"`
 	// AutoLand lands an atomic stack by itself once every part is approved and
 	// green (checked on reviews, finished CI runs and the timer).
-	AutoLand bool         `json:"autoLand"`
-	Flags    *split.Flags `json:"flags"`
-	Priority *prio.Config `json:"priority"`
+	AutoLand bool `json:"autoLand"`
+	// AllowUnreviewed skips the approval gate for atomic landings (CI and
+	// land). Checks, requested changes and stacking are still enforced.
+	AllowUnreviewed bool         `json:"allowUnreviewed"`
+	Flags           *split.Flags `json:"flags"`
+	Priority        *prio.Config `json:"priority"`
 }
 
 func (c *common) runner(r *git.Repo) *land.Runner {
 	return &land.Runner{Repo: r, Forge: &forge.GH{Dir: r.Dir}, Remote: c.remote, Log: os.Stdout,
-		MinApprovals: c.cfg.MinApprovals, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority}
+		MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority}
 }
 
 type common struct {
@@ -468,7 +471,7 @@ func cmdLand(args []string) error {
 	if *minApprovals > 0 {
 		run.MinApprovals = *minApprovals
 	}
-	run.AllowUnreviewed = *unreviewed
+	run.AllowUnreviewed = run.AllowUnreviewed || *unreviewed
 	return run.Land(n)
 }
 
