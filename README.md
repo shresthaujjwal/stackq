@@ -196,6 +196,12 @@ Patterns follow gitignore semantics:
 - **Incremental mode** takes one queue run per PR, since PRs that don't target `main` can't be queued.
 - **Guard lint** covers Go only, and is a lint, not a proof (SPEC §29.3).
 
+## Releases
+
+Every merged PR is released automatically: tests run, the version goes up (patch by default; put `[minor]` or `[major]` in the PR title for more), and binaries for Linux, macOS and Windows are attached to a GitHub release with a `checksums.txt`. The latest is always at `https://github.com/OWNER/stackq/releases/latest/download/stackq_linux_amd64`, and `stackq version` tells you which release you have.
+
+The Action downloads and verifies that binary instead of compiling stackq on every run, so pin it with `uses: OWNER/stackq@v0` (follows the newest `v0.x.y`) or `@v0.3.1` (that exact release). If the download or checksum fails it builds from source. See SPEC §15.5.
+
 ## Development
 
 ```sh

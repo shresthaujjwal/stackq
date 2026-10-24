@@ -21,6 +21,19 @@ import (
 	"stackq/internal/stack"
 )
 
+// Set at release time: -X main.version=v1.2.3 -X main.commit=abc1234.
+var (
+	version = "dev"
+	commit  = ""
+)
+
+func versionString() string {
+	if commit == "" {
+		return "stackq " + version
+	}
+	return "stackq " + version + " (" + commit + ")"
+}
+
 const usage = `stackq: split a big branch into stacked PRs and land them through the merge queue
 
 Local workflow:
@@ -40,6 +53,8 @@ CI (GitHub Actions):
   stackq ci                                          act on the current event
   stackq ci after-merge|dequeued|land|revert --pr N  or run a step directly
   stackq ci schedule                                 one priority pass
+
+  stackq version                                     print the release this binary was built from
 
 Common flags: -C DIR, --stack NAME, --remote NAME
 Config: .stackq.json at the repo root (trunk, remote, prefix, maxLines, check,
@@ -76,6 +91,9 @@ func main() {
 		err = cmdQueue(args)
 	case "ci":
 		err = cmdCI(args)
+	case "version", "-v", "--version":
+		fmt.Println(versionString())
+		return
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return

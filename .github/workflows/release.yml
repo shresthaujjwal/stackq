@@ -1,0 +1,93 @@
+# Every push to main (a merged PR) gets a version, a GitHub release, and
+# binaries that other workflows can download instead of building stackq.
+#
+# Version: the next patch after the latest vX.Y.Z tag (v0.1.0 for the first).
+# Put [minor] or [major] in a PR title to bump that part instead.
+#
+# Assets (stable names, so releases/latest/download/<name> always works):
+#   stackq_linux_amd64  stackq_linux_arm64  stackq_darwin_amd64
+#   stackq_darwin_arm64  stackq_windows_amd64.exe  checksums.txt
+# The major tag (v0) is moved to the release, so `uses: OWNER/stackq@v0` works.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+# One release at a time. A newer push replaces a waiting run; the newest run
+# releases everything merged so far.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags and history for the version and the notes
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: gofmt -l . | tee /dev/stderr | (! read)
+      - run: go vet ./...
+      - run: go test -race ./...
+
+      - name: Next version
+        id: v
+        run: |
+          set -euo pipefail
+          if [ -n "$(git tag --points-at HEAD 'v*')" ]; then
+            echo "HEAD is already released"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          if [ -z "$last" ]; then
+            maj=0; min=1; pat=0
+          else
+            IFS=. read -r maj min pat <<<"${last#v}"
+            msgs=$(git log "$last..HEAD" --format=%B)
+            if grep -qiF '[major]' <<<"$msgs"; then maj=$((maj + 1)); min=0; pat=0
+            elif grep -qiF '[minor]' <<<"$msgs"; then min=$((min + 1)); pat=0
+            else pat=$((pat + 1)); fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "tag=v$maj.$min.$pat" >> "$GITHUB_OUTPUT"
+          echo "major=v$maj" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        if: steps.v.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os=${t%/*}; arch=${t#*/}; ext=""
+            [ "$os" = windows ] && ext=.exe
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$TAG -X main.commit=${GITHUB_SHA::7}" \
+              -o "dist/stackq_${os}_${arch}${ext}" ./cmd/stackq
+          done
+          (cd dist && sha256sum stackq_* > checksums.txt && cat checksums.txt)
+          # The binary must report the version it will be released as.
+          test "$(./dist/stackq_linux_amd64 version)" = "stackq $TAG (${GITHUB_SHA::7})"
+
+      - name: Release
+        if: steps.v.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+          MAJOR: ${{ steps.v.outputs.major }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+          git tag -f "$MAJOR" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$MAJOR"

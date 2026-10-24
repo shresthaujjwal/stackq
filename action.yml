@@ -25,6 +25,14 @@ inputs:
       interpreted), e.g. `--no-enqueue` for `ci` or `--max-lines 300` for `split`.
     required: false
     default: ""
+  version:
+    description: >
+      Which stackq release to run: `latest` (the default; or the tag the
+      workflow pins, such as `@v0.3.1`), a tag like `v0.3.1`, or `source` to
+      build the action's own checkout. A failed download or checksum falls
+      back to building from source.
+    required: false
+    default: latest
 
 runs:
   using: composite
@@ -34,10 +42,41 @@ runs:
         go-version: stable
         cache: false
 
-    - name: Build stackq
+    - name: Get stackq
       shell: bash
-      working-directory: ${{ github.action_path }}
-      run: go build -o "$RUNNER_TEMP/stackq" ./cmd/stackq
+      env:
+        VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+        ACTION_REPO: ${{ github.action_repository }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        os=linux; arch=amd64
+        case "$RUNNER_OS" in macOS) os=darwin ;; Windows) os=windows ;; esac
+        case "$RUNNER_ARCH" in ARM64) arch=arm64 ;; esac
+        ext=""; [ "$os" = windows ] && ext=.exe
+        asset="stackq_${os}_${arch}${ext}"
+        bin="$RUNNER_TEMP/stackq$ext"
+
+        tag="$VERSION"
+        if [ "$tag" = latest ] && [[ "$ACTION_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then tag="$ACTION_REF"; fi
+        if [ "$tag" = latest ]; then
+          base="https://github.com/$ACTION_REPO/releases/latest/download"
+        else
+          base="https://github.com/$ACTION_REPO/releases/download/$tag"
+        fi
+
+        if [ "$VERSION" != source ] \
+          && curl -fsSL --retry 3 -o "$bin" "$base/$asset" \
+          && curl -fsSL --retry 3 -o "$RUNNER_TEMP/checksums.txt" "$base/checksums.txt" \
+          && (cd "$RUNNER_TEMP" && grep " $asset\$" checksums.txt | sed "s# $asset# stackq$ext#" | sha256sum -c --quiet -); then
+          chmod +x "$bin"
+          echo "stackq: using the released binary ($tag, $asset)"
+        else
+          [ "$VERSION" = source ] || echo "::warning::stackq: no verified release binary for '$tag'; building from source"
+          (cd "$ACTION_PATH" && go build -o "$bin" ./cmd/stackq)
+        fi
+        "$bin" version
 
     - name: Run stackq
       shell: bash
