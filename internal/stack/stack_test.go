@@ -314,3 +314,43 @@ func TestFlagStackEveryPartBuildsAndActivationIsDraft(t *testing.T) {
 		t.Fatalf("activation marker: %+v", m)
 	}
 }
+
+// Moving a package to another directory used to glue the move and all its
+// importers into one slice. Now each step builds on its own.
+func TestCreateMovedPackageEveryBranchBuilds(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not on PATH")
+	}
+	r := testrepo.New(t)
+	testrepo.Commit(t, r, "base", map[string]string{
+		"go.mod":           "module example.com/m\n\ngo 1.22\n",
+		"oldpkg/x.go":      "package oldpkg\n\n// Value is shared by many callers in the code base.\nfunc Value() int { return 42 }\n",
+		"caller/caller.go": "package caller\n\nimport \"example.com/m/oldpkg\"\n\nfunc V() int { return oldpkg.Value() }\n",
+		"other/other.go":   "package other\n\nimport \"example.com/m/oldpkg\"\n\nfunc W() int { return oldpkg.Value() }\n",
+	})
+	testrepo.Must(t, r, "checkout", "-q", "-b", "feature")
+	testrepo.Must(t, r, "mv", "oldpkg", "newpkg")
+	testrepo.Commit(t, r, "move", map[string]string{
+		"newpkg/x.go":      "package newpkg\n\n// Value is shared by many callers in the code base.\nfunc Value() int { return 42 }\n",
+		"caller/caller.go": "package caller\n\nimport \"example.com/m/newpkg\"\n\nfunc V() int { return newpkg.Value() }\n",
+		"other/other.go":   "package other\n\nimport \"example.com/m/newpkg\"\n\nfunc W() int { return newpkg.Value() }\n",
+	})
+	var log bytes.Buffer
+	p, err := split.Make(r, split.Options{Base: "main", Head: "feature", MaxLines: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := stack.Create(r, p, stack.CreateOptions{
+		Name: "mv", Prefix: "stack/mv/", Trunk: "main", Source: "feature",
+		Check: "go build ./...", Log: &log,
+	})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, log.String())
+	}
+	if len(s.Branches) < 3 || strings.Contains(log.String(), "✗") {
+		t.Fatalf("want the move spread over several clean slices, got %d:\n%s", len(s.Branches), log.String())
+	}
+	if !r.TreesEqual(s.Branches[len(s.Branches)-1].Name, "feature") {
+		t.Fatal("top of stack differs from feature")
+	}
+}
