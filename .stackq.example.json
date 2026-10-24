@@ -1,0 +1,107 @@
+{
+  "trunk": "main",
+  "remote": "origin",
+  "prefix": "stack/{name}/",
+  "maxLines": 400,
+  "check": "go build ./... && go vet ./...",
+  "mergeOnFail": true,
+  "landing": "atomic",
+  "minApprovals": 1,
+  "closeSource": true,
+  "flags": {
+    "paths": [
+      "internal/flags/",
+      "config/flags/*.yaml"
+    ],
+    "activation": [
+      "config/env/prod/*.yaml"
+    ],
+    "guards": [
+      "flags.Enabled"
+    ],
+    "entrypoints": [
+      "HandleFunc",
+      "Handle",
+      "RegisterWorkflow",
+      "RegisterActivity"
+    ],
+    "enforce": false
+  },
+  "priority": {
+    "enabled": true,
+    "label": "stackq:queue",
+    "maxInFlight": 3,
+    "agingMinutes": 30,
+    "maxJumpsInFlight": 1,
+    "requireApproval": true,
+    "classes": [
+      {
+        "name": "urgent",
+        "weight": 100,
+        "jump": true,
+        "match": {
+          "labels": [
+            "security",
+            "vulnerability",
+            "hotfix",
+            "stackq:revert"
+          ],
+          "branches": [
+            "hotfix/*",
+            "security/*"
+          ],
+          "titleRegex": "(?i)\\b(CVE-\\d{4}-\\d{4,}|GHSA(-[0-9a-z]{4}){3})\\b|\\bsecurity fix\\b",
+          "bodyRegex": "(?i)\\b(CVE-\\d{4}-\\d{4,}|GHSA(-[0-9a-z]{4}){3})\\b",
+          "reverts": true
+        }
+      },
+      {
+        "name": "bots",
+        "weight": 30,
+        "match": {
+          "authors": [
+            "dependabot[bot]",
+            "renovate[bot]",
+            "app/dependabot",
+            "app/renovate"
+          ],
+          "labels": [
+            "automerge",
+            "dependencies"
+          ],
+          "branches": [
+            "dependabot/*",
+            "renovate/*"
+          ]
+        }
+      },
+      {
+        "name": "small",
+        "weight": 20,
+        "match": {
+          "maxLines": 50,
+          "maxFiles": 5
+        }
+      },
+      {
+        "name": "normal",
+        "weight": 0
+      }
+    ]
+  },
+  "slices": [
+    {
+      "name": "proto",
+      "paths": [
+        "proto/",
+        "*.proto"
+      ]
+    },
+    {
+      "name": "migrations",
+      "paths": [
+        "/db/migrations/"
+      ]
+    }
+  ]
+}
