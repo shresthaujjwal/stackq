@@ -1,6 +1,7 @@
 package land_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -164,5 +165,24 @@ func TestAtomicLandAndRevertGoThroughPriority(t *testing.T) {
 	}
 	if got := queueOrder(fx.f); len(got) != 2 || got[0] != rev.Number || !fx.f.Labels[rev.Number]["stackq:prio:urgent"] {
 		t.Fatalf("revert should jump the queue: %v labels=%v", got, fx.f.Labels[rev.Number])
+	}
+}
+
+func TestSchedulerEmptyPoolNeedsNoMergeQueue(t *testing.T) {
+	f := forge.NewFake()
+	f.QueueErr = errors.New("branch main has no merge queue")
+	run := &land.Runner{Forge: f, Prio: prioCfg(), Now: func() time.Time { return t0 }}
+	if _, err := run.Schedule("main", false); err != nil {
+		t.Fatalf("an empty pool must not need a merge queue: %v", err)
+	}
+}
+
+func TestSchedulerWaitingPRNeedsMergeQueue(t *testing.T) {
+	f := forge.NewFake()
+	f.QueueErr = errors.New("branch main has no merge queue")
+	addPR(f, "fix/typo", "main", "Fix typo", "", "cy", 2, 1, time.Minute)
+	run := &land.Runner{Forge: f, Prio: prioCfg(), Now: func() time.Time { return t0 }}
+	if _, err := run.Schedule("main", false); err == nil {
+		t.Fatal("a waiting PR with no merge queue should still be an error")
 	}
 }

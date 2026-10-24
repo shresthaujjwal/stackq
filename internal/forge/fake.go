@@ -25,6 +25,8 @@ type Fake struct {
 	// passing checks.
 	PRDetails  map[int]Details
 	EnqueueErr error
+	// QueueErr makes Queue fail, as when the branch has no merge queue.
+	QueueErr error
 	// HeadSHA resolves a branch to its current tip so open PRs track pushes.
 	HeadSHA func(branch string) string
 }
@@ -175,6 +177,9 @@ func (f *Fake) ListPool(label string) ([]PR, error) {
 func (f *Fake) Queue(branch string) ([]QueueEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.QueueErr != nil {
+		return nil, f.QueueErr
+	}
 	return append([]QueueEntry{}, f.MQ...), nil
 }
 
