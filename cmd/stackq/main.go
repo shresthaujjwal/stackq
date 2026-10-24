@@ -101,11 +101,14 @@ type config struct {
 	CloseSource bool         `json:"closeSource"`
 	Slices      []split.Rule `json:"slices"`
 	// Landing is "atomic" (default) or "incremental".
-	Landing      string       `json:"landing"`
-	MinApprovals int          `json:"minApprovals"`
-	KeepBranches bool         `json:"keepBranches"`
-	Flags        *split.Flags `json:"flags"`
-	Priority     *prio.Config `json:"priority"`
+	Landing      string `json:"landing"`
+	MinApprovals int    `json:"minApprovals"`
+	KeepBranches bool   `json:"keepBranches"`
+	// AutoLand lands an atomic stack by itself once every part is approved and
+	// green (checked on reviews, finished CI runs and the timer).
+	AutoLand bool         `json:"autoLand"`
+	Flags    *split.Flags `json:"flags"`
+	Priority *prio.Config `json:"priority"`
 }
 
 func (c *common) runner(r *git.Repo) *land.Runner {
@@ -565,7 +568,7 @@ func cmdCI(args []string) error {
 		poolLabel = c.cfg.Priority.Label
 	}
 	if sub == "" {
-		if sub, n, err = fromEvent(poolLabel); err != nil {
+		if sub, n, err = fromEvent(poolLabel, c.cfg.AutoLand); err != nil {
 			return err
 		}
 		if sub == "" {
@@ -573,7 +576,7 @@ func cmdCI(args []string) error {
 			return nil
 		}
 	}
-	if n == 0 && sub != "schedule" {
+	if n == 0 && sub != "schedule" && sub != "tick" {
 		return fmt.Errorf("ci %s needs --pr", sub)
 	}
 	if out, _ := r.Run("config", "user.email"); out == "" {
@@ -600,6 +603,18 @@ func cmdCI(args []string) error {
 	case "schedule":
 		_, err := run.Schedule(trunk, false)
 		return err
+	case "tick":
+		// Land stacks that became ready, then refill the queue by priority.
+		var err error
+		if c.cfg.AutoLand {
+			err = run.AutoLand()
+		}
+		if run.Prio != nil && run.Prio.Enabled {
+			if _, serr := run.Schedule(trunk, false); serr != nil {
+				err = errors.Join(err, serr)
+			}
+		}
+		return err
 	case "after-merge":
 		return afterwards(run.AfterMerge(n))
 	case "dequeued":
@@ -610,11 +625,11 @@ func cmdCI(args []string) error {
 		_, err := run.Revert(n, land.RevertOptions{Enqueue: *revertEnqueue})
 		return err
 	}
-	return fmt.Errorf("unknown ci command %q (after-merge, dequeued, land, revert, schedule)", sub)
+	return fmt.Errorf("unknown ci command %q (after-merge, dequeued, land, revert, schedule, tick)", sub)
 }
 
 // fromEvent maps the GitHub Actions event to a ci command.
-func fromEvent(poolLabel string) (string, int, error) {
+func fromEvent(poolLabel string, autoLand bool) (string, int, error) {
 	name, p := os.Getenv("GITHUB_EVENT_NAME"), os.Getenv("GITHUB_EVENT_PATH")
 	if name == "" || p == "" {
 		return "", 0, fmt.Errorf("not running in GitHub Actions; use stackq ci <after-merge|dequeued|land|revert|schedule> --pr N")
@@ -652,9 +667,10 @@ func fromEvent(poolLabel string) (string, int, error) {
 		}
 		return "", 0, nil
 	case "pull_request_review", "workflow_run", "check_suite", "schedule":
-		// An approval or a finished CI run can make a pool PR eligible.
-		if poolLabel != "" {
-			return "schedule", 0, nil
+		// An approval or a finished CI run can make a pool PR eligible, or
+		// the last gate of a stack pass.
+		if poolLabel != "" || autoLand {
+			return "tick", 0, nil
 		}
 		return "", 0, nil
 	case "workflow_dispatch":
@@ -662,7 +678,7 @@ func fromEvent(poolLabel string) (string, int, error) {
 		if cmd == "" || cmd == "<nil>" {
 			cmd = "land"
 		}
-		if cmd == "schedule" {
+		if cmd == "schedule" || cmd == "tick" {
 			return cmd, 0, nil
 		}
 		n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(fmt.Sprint(ev.Inputs["pr"])), "#"))

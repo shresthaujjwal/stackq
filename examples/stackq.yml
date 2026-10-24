@@ -8,18 +8,18 @@ on:
     # labeled:       a PR joined the priority pool (stackq:queue)
     types: [closed, dequeued, labeled]
   pull_request_review:
-    types: [submitted] # an approval can make a pool PR eligible
+    types: [submitted] # an approval can make a pool PR or a whole stack ready
   workflow_run:
-    workflows: [ci] # the name of your CI workflow: a green run can make a pool PR eligible
+    workflows: [ci] # the name of your CI workflow: a green run can make a pool PR or a stack ready
     types: [completed]
   schedule:
-    - cron: "*/5 * * * *" # safety net for missed events; drop it if you don't use priority
+    - cron: "*/5 * * * *" # safety net for missed events; drop it if you use neither priority nor autoLand
   workflow_dispatch:
     inputs:
       command:
         description: What to do
         type: choice
-        options: [land, after-merge, revert, schedule]
+        options: [land, after-merge, revert, schedule, tick]
         default: land
       pr:
         description: PR number (not needed for schedule)

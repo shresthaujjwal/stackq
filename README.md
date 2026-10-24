@@ -151,6 +151,8 @@ If the big branch already has an open PR, `stackq push` finds it (or pass `--fro
 
 To split from GitHub instead of a laptop, copy `examples/stackq-split.yml`. Label a big PR `stackq:split` (create the label once) and the Action splits its branch, opens the stacked PRs, links them from the original PR, closes it, and removes the label. You can also run the workflow by hand with a branch name. It uses a `STACKQ_TOKEN` secret if you set one, and the built-in token otherwise (then enable "Allow GitHub Actions to create and approve pull requests"). PRs from forks are ignored.
 
+**Landing by itself.** Set `"autoLand": true` in `.stackq.json` and an atomic stack lands as soon as the last part is approved and green. The workflow checks on every review, finished CI run and the 5-minute timer; a stack that isn't ready is left alone quietly, and one that is already landing is not queued twice.
+
 Manual controls, through workflow_dispatch or locally:
 
 ```sh
