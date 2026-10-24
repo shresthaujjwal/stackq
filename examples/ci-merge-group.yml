@@ -1,0 +1,19 @@
+# Your existing CI needs the merge_group trigger, or queued PRs never get
+# checked and the queue stalls. Add it next to pull_request:
+name: ci
+
+on:
+  # No branch filter: stack parts target stack/** branches, and atomic
+  # landing needs their checks. (Or use branches: [main, 'stack/**'].)
+  pull_request:
+  merge_group:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./... && go test ./...

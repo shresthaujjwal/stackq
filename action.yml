@@ -1,0 +1,41 @@
+name: stackq
+description: Restack stacked PRs and feed them through GitHub's merge queue, one after another.
+branding:
+  icon: layers
+  color: blue
+
+inputs:
+  token:
+    description: >
+      Token that can push branches, edit PRs and enqueue them. Use a GitHub App
+      token or a PAT: pushes made with GITHUB_TOKEN do not trigger your CI, so
+      a restacked PR would never get the checks the queue needs.
+    required: true
+  args:
+    description: Extra arguments for `stackq ci`, e.g. `--no-enqueue`.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version: stable
+        cache: false
+
+    - name: Build stackq
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: go build -o "$RUNNER_TEMP/stackq" ./cmd/stackq
+
+    - name: Run stackq
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        STACKQ_ARGS: ${{ inputs.args }}
+      run: |
+        git config user.name  >/dev/null || git config user.name  "stackq[bot]"
+        git config user.email >/dev/null || git config user.email "stackq-bot@users.noreply.github.com"
+        # shellcheck disable=SC2086
+        "$RUNNER_TEMP/stackq" ci $STACKQ_ARGS
