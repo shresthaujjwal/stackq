@@ -1,6 +1,9 @@
 # Every push to main (a merged PR) gets a version, a GitHub release, and
 # binaries that other workflows can download instead of building stackq.
 #
+# Release notes list every merged PR since the last release (author, size,
+# description), direct commits, checksums, and how to use the release.
+#
 # Version: the next patch after the latest vX.Y.Z tag (v0.1.0 for the first).
 # Put [minor] or [major] in a PR title to bump that part instead.
 #
@@ -50,17 +53,19 @@ jobs:
           fi
           last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
           if [ -z "$last" ]; then
-            maj=0; min=1; pat=0
+            maj=0; min=1; pat=0; why="first release"
           else
             IFS=. read -r maj min pat <<<"${last#v}"
             msgs=$(git log "$last..HEAD" --format=%B)
-            if grep -qiF '[major]' <<<"$msgs"; then maj=$((maj + 1)); min=0; pat=0
-            elif grep -qiF '[minor]' <<<"$msgs"; then min=$((min + 1)); pat=0
-            else pat=$((pat + 1)); fi
+            if grep -qiF '[major]' <<<"$msgs"; then maj=$((maj + 1)); min=0; pat=0; why="major, because a PR title says [major]"
+            elif grep -qiF '[minor]' <<<"$msgs"; then min=$((min + 1)); pat=0; why="minor, because a PR title says [minor]"
+            else pat=$((pat + 1)); why="patch (the default)"; fi
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "tag=v$maj.$min.$pat" >> "$GITHUB_OUTPUT"
           echo "major=v$maj" >> "$GITHUB_OUTPUT"
+          echo "prev=$last" >> "$GITHUB_OUTPUT"
+          echo "why=$why" >> "$GITHUB_OUTPUT"
 
       - name: Build
         if: steps.v.outputs.skip != 'true'
@@ -84,10 +89,17 @@ jobs:
         if: steps.v.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           TAG: ${{ steps.v.outputs.tag }}
           MAJOR: ${{ steps.v.outputs.major }}
+          PREV: ${{ steps.v.outputs.prev }}
+          WHY: ${{ steps.v.outputs.why }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+          # Per-PR details, sizes, checksums and usage; see the script.
+          python3 .github/scripts/release_notes.py --repo "$GITHUB_REPOSITORY" --tag "$TAG" \
+            --prev "$PREV" --bump "$WHY" --checksums dist/checksums.txt > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
           git tag -f "$MAJOR" "$GITHUB_SHA"
           git push -f origin "refs/tags/$MAJOR"
