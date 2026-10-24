@@ -201,6 +201,7 @@ func Make(r *git.Repo, o Options) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	changes = splitMoves(r, base, head, changes)
 	if len(changes) == 0 {
 		return nil, fmt.Errorf("%s has no changes relative to %s", o.Head, o.Base)
 	}
@@ -385,6 +386,42 @@ func Make(r *git.Repo, o Options) (*Plan, error) {
 		}
 	}
 	return plan, nil
+}
+
+// splitMoves plans a rename across directories as an add of the new path and a
+// delete of the old one. Kept as a single change it is both at once: its
+// importers must land after the new location exists and before the old one is
+// deleted, which glues the move and every importer into one slice. Split, the
+// new copy lands first, importers switch over, and the old copy is deleted
+// last, and every step still builds because the two directories are different
+// packages. A rename inside one directory stays whole: both files would
+// declare the same symbols in the same package.
+func splitMoves(r *git.Repo, base, head string, changes []git.Change) []git.Change {
+	out := make([]git.Change, 0, len(changes))
+	for _, c := range changes {
+		if c.Status != 'R' || path.Dir(c.Path) == path.Dir(c.OldPath) {
+			out = append(out, c)
+			continue
+		}
+		oldSrc, err1 := r.Show(base, c.OldPath)
+		newSrc, err2 := r.Show(head, c.Path)
+		if err1 != nil || err2 != nil {
+			out = append(out, c)
+			continue
+		}
+		out = append(out,
+			git.Change{Status: 'A', Path: c.Path, Added: lineCount(newSrc), Binary: c.Binary},
+			git.Change{Status: 'D', Path: c.OldPath, Deleted: lineCount(oldSrc), Binary: c.Binary})
+	}
+	return out
+}
+
+func lineCount(b []byte) int {
+	n := strings.Count(string(b), "\n")
+	if len(b) > 0 && b[len(b)-1] != '\n' {
+		n++
+	}
+	return n
 }
 
 // order collapses import cycles into single groups and returns groups in a

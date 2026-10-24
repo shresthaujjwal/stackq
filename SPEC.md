@@ -400,7 +400,9 @@ Entry point: `split.Make(repo, Options{Base, Head, MaxLines, Rules}) (*Plan, err
    
    A multi-member SCC adds a warning: "import cycle kept together in one slice: …".
 
-   A rename produces a natural cycle: importers depend on the new dir, and the rename's deletion of the old dir depends on the importers' old imports. So a renamed package and its updated importers always end up in the same slice. That is the correct outcome, since splitting them would break the build in between.
+   A rename within one directory stays a single change, so both halves land together (two files in one package would declare the same symbols). A rename **across directories** is planned as an add of the new path and a delete of the old one (`splitMoves`). Kept whole, it is a cycle with every importer: importers depend on the new dir, and the deletion of the old dir depends on the importers' old imports. Split, the new copy lands first, importers switch to it, and the old copy is deleted last. The two directories are different packages, so every step builds. Line counts for the two halves are the whole files, not the rename's diff.
+
+   What the import graph cannot see: a moved or renamed *type* that appears in another package's API (for example a function now returns `money.Cents` instead of `util.Cents`) couples that package to its callers, even though no import changed. `--check` catches this and folds the failing slice into the next one, which can pull unrelated slices along. Add a `slices` rule that names the coupled packages so they ship together and nothing else is dragged in.
 6. **Topological order.** Kahn's algorithm runs on the condensation. Among ready nodes it always picks the smallest `(category, key)`. This is O(n²) in groups, which is fine for hundreds of directories. Revisit if a split ever has more than about 5,000 directories.
 7. **Pack.** Walk the ordered groups and accumulate them into the current slice. Start a new slice when any of these holds:
    - the next group is pinned (from a rule),

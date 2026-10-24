@@ -114,34 +114,78 @@ func TestPlanCycleStaysTogether(t *testing.T) {
 	}
 }
 
-func TestPlanRenameMovesWithImporters(t *testing.T) {
+func sliceOf(p *Plan, file string, status byte) int {
+	for i, s := range p.Slices {
+		for _, f := range s.Files {
+			if f.Path == file && f.Status == status {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// A package moved to another directory is planned as add, switch importers,
+// delete: no cycle, and every step has both copies or only the one in use.
+func TestPlanMoveAcrossDirsOrdersAddImportersDelete(t *testing.T) {
 	r := testrepo.New(t)
 	testrepo.Commit(t, r, "base", map[string]string{
 		"go.mod":             "module example.com/m\n\ngo 1.22\n",
 		"oldpkg/x.go":        "package oldpkg\n\n// Value is shared by many callers in the code base.\nfunc Value() int { return 42 }\n",
 		"caller/caller.go":   "package caller\n\nimport \"example.com/m/oldpkg\"\n\nfunc V() int { return oldpkg.Value() }\n",
+		"other/other.go":     "package other\n\nimport \"example.com/m/oldpkg\"\n\nfunc W() int { return oldpkg.Value() }\n",
 		"unrelated/other.go": "package unrelated\n",
 	})
 	testrepo.Must(t, r, "checkout", "-q", "-b", "feature")
 	testrepo.Must(t, r, "mv", "oldpkg", "newpkg")
-	testrepo.Commit(t, r, "rename", map[string]string{
+	testrepo.Commit(t, r, "move", map[string]string{
 		"newpkg/x.go":        "package newpkg\n\n// Value is shared by many callers in the code base.\nfunc Value() int { return 42 }\n",
 		"caller/caller.go":   "package caller\n\nimport \"example.com/m/newpkg\"\n\nfunc V() int { return newpkg.Value() }\n",
+		"other/other.go":     "package other\n\nimport \"example.com/m/newpkg\"\n\nfunc W() int { return newpkg.Value() }\n",
 		"unrelated/other.go": "package unrelated\n\nconst X = 1\n",
 	})
 	p, err := Make(r, Options{Base: "main", Head: "feature", MaxLines: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range p.Slices {
-		var paths []string
-		for _, f := range s.Files {
-			paths = append(paths, f.Path)
+	for _, w := range p.Warnings {
+		if strings.Contains(w, "cycle") {
+			t.Fatalf("a move must not create a cycle: %v", p.Warnings)
 		}
-		joined := strings.Join(paths, ",")
-		if strings.Contains(joined, "newpkg/x.go") != strings.Contains(joined, "caller/caller.go") {
-			t.Fatalf("rename and its importer were split apart: %v", names(p))
-		}
+	}
+	add := sliceOf(p, "newpkg/x.go", 'A')
+	del := sliceOf(p, "oldpkg/x.go", 'D')
+	caller := sliceOf(p, "caller/caller.go", 'M')
+	other := sliceOf(p, "other/other.go", 'M')
+	if add < 0 || del < 0 || caller < 0 || other < 0 {
+		t.Fatalf("missing changes (add %d, del %d, caller %d, other %d): %v", add, del, caller, other, names(p))
+	}
+	if !(add < caller && add < other && caller < del && other < del) {
+		t.Fatalf("want new copy, then importers, then delete; got add %d, caller %d, other %d, delete %d", add, caller, other, del)
+	}
+}
+
+// A rename inside one directory keeps both halves together: two files in one
+// package would otherwise declare the same symbols.
+func TestPlanRenameInSameDirStaysWhole(t *testing.T) {
+	r := testrepo.New(t)
+	body := "package p\n\n// Value is shared by many callers in the code base.\nfunc Value() int { return 42 }\n"
+	testrepo.Commit(t, r, "base", map[string]string{
+		"go.mod":   "module example.com/m\n\ngo 1.22\n",
+		"p/old.go": body,
+	})
+	testrepo.Must(t, r, "checkout", "-q", "-b", "feature")
+	testrepo.Must(t, r, "mv", "p/old.go", "p/new.go")
+	testrepo.Commit(t, r, "rename", map[string]string{"p/new.go": body})
+	p, err := Make(r, Options{Base: "main", Head: "feature", MaxLines: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sliceOf(p, "p/new.go", 'R'); got < 0 {
+		t.Fatalf("a same-directory rename should stay one R change: %v", names(p))
+	}
+	if sliceOf(p, "p/old.go", 'D') >= 0 {
+		t.Fatalf("old path must not be planned as a separate delete: %v", names(p))
 	}
 }
 

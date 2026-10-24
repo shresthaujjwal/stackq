@@ -185,6 +185,7 @@ Patterns follow gitignore semantics:
 ## Limits
 
 - **File-level splitting only.** A file never spans two slices. If one file must be split, do it by hand with `git restore -p --source=<big-branch>` on the relevant branch, then run `stackq sync`.
+- **API-level coupling.** The import graph can't see that a package's exported types changed under its callers (for example a function that now returns a renamed type). `--check` catches it by folding the failing slice into the next one, which can pull unrelated slices along. Add a `slices` rule naming the coupled packages so only they ship together.
 - **Import resolution.** TS path aliases (`@/…`) and bare package imports are not resolved. Use `slices` rules or `--check` to keep those orders right.
 - **Squash merges.** Local `stackq sync` detects landed branches by patch equivalence (`git cherry`). That works for rebase and merge commits, but not squash. The CI restack works with every merge method, because it cuts at the parent's recorded pre-merge head.
 - **Atomic mode needs live verification.** It has been tested against a fake GitHub only. On real GitHub, check how CODEOWNERS and approval rules treat the retargeted top PR, and make sure CI runs on PRs targeting `stack/**` branches. See SPEC §28.6.
