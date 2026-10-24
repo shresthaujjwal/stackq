@@ -425,7 +425,7 @@ func (g *GH) Queue(branch string) ([]QueueEntry, error) {
 	}
 	mq := raw.Data.Repository.MergeQueue
 	if mq == nil {
-		return nil, fmt.Errorf("branch %s has no merge queue", branch)
+		return nil, fmt.Errorf("branch %s has no merge queue (turn it on in the branch rules, and check that the token can read it)", branch)
 	}
 	var entries []QueueEntry
 	for _, n := range mq.Entries.Nodes {

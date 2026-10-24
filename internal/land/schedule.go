@@ -45,6 +45,13 @@ func (c *Runner) Schedule(trunk string, dryRun bool) ([]prio.Decision, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(pool) == 0 {
+		// Nothing to admit, so don't require a readable merge queue: this pass
+		// runs on every merge and on a timer, including in repos where the
+		// queue isn't enabled yet.
+		c.logf("priority pool is empty; nothing to queue")
+		return nil, nil
+	}
 	queue, err := c.Forge.Queue(trunk)
 	if err != nil {
 		return nil, err
