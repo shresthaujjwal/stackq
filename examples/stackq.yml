@@ -18,8 +18,13 @@ on:
   workflow_run:
     workflows: [ci] # the name of your CI workflow: a green run can make a pool PR or a stack ready
     types: [completed]
+  # A safety net, not a clock. GitHub runs schedules late or skips them when it
+  # is busy (in a quiet test repo this ran about every two hours, not every
+  # five minutes). Every step above is started by an event; this only catches
+  # what a lost event left behind. Drop it if you use neither priority nor
+  # autoLand.
   schedule:
-    - cron: "*/5 * * * *" # safety net for missed events; drop it if you use neither priority nor autoLand
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       command:
