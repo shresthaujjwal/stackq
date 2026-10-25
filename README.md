@@ -149,6 +149,8 @@ If the big branch already has an open PR, `stackq push` finds it (or pass `--fro
 3. **stackq workflow.** Copy `examples/stackq.yml` to `.github/workflows/`, and point `uses:` at wherever you host this repo.
 4. **Token.** Give the workflow a GitHub App token or a fine-grained PAT with contents and pull-requests write access. Pushes made with the default `GITHUB_TOKEN` don't trigger other workflows, so a restacked PR would never get its checks.
 
+The files in `examples/` (`ci-merge-group.yml`, `stackq.yml`, `stackq-split.yml`) are meant to be copied unchanged apart from `YOUR_ORG`, so a repo's copies can be diffed against them to catch drift.
+
 To split from GitHub instead of a laptop, copy `examples/stackq-split.yml`. Label a big PR `stackq:split` (create the label once) and the Action splits its branch, opens the stacked PRs, links them from the original PR, closes it, and removes the label. You can also run the workflow by hand with a branch name. It uses a `STACKQ_TOKEN` secret if you set one, and the built-in token otherwise (then enable "Allow GitHub Actions to create and approve pull requests"). PRs from forks are ignored.
 
 **Landing by itself.** Set `"autoLand": true` in `.stackq.json` and an atomic stack lands as soon as the last part is approved and green. The workflow checks on every review, finished CI run and the 5-minute timer; a stack that isn't ready is left alone quietly, and one that is already landing is not queued twice.
@@ -200,7 +202,7 @@ Patterns follow gitignore semantics:
 
 Every merged PR is released automatically: tests run, the version goes up (patch by default; put `[minor]` or `[major]` in the PR title for more), and binaries for Linux, macOS and Windows are attached to a GitHub release with a `checksums.txt`. The latest is always at `https://github.com/OWNER/stackq/releases/latest/download/stackq_linux_amd64`, and `stackq version` tells you which release you have.
 
-The Action downloads and verifies that binary instead of compiling stackq on every run, so pin it with `uses: OWNER/stackq@v0` (follows the newest `v0.x.y`) or `@v0.3.1` (that exact release). If the download or checksum fails it builds from source. See SPEC §15.5.
+The Action downloads and verifies that binary instead of compiling stackq on every run. By default (`uses: OWNER/stackq@v0`) it runs the newest release, so there is nothing to bump. For reproducible runs pin one with `version: v0.3.1` or `uses: OWNER/stackq@v0.3.1`. If the download or checksum fails it builds from source. See SPEC §15.5.
 
 ## Development
 

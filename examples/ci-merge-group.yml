@@ -1,12 +1,18 @@
-# Your existing CI needs the merge_group trigger, or queued PRs never get
-# checked and the queue stalls. Add it next to pull_request:
+# Your CI needs three triggers for stackq. Replace the steps with your build
+# and tests.
 name: ci
 
 on:
   # No branch filter: stack parts target stack/** branches, and atomic
   # landing needs their checks. (Or use branches: [main, 'stack/**'].)
   pull_request:
+  # The merge queue runs this workflow on its temporary branches; without it
+  # queued PRs are never checked and the queue stalls.
   merge_group:
+  # Lets the stackq workflows start CI on branches they pushed with the
+  # built-in token (pushes made with GITHUB_TOKEN do not trigger pull_request
+  # runs). Not needed if you give stackq a PAT or an App token.
+  workflow_dispatch:
 
 jobs:
   test:
@@ -16,4 +22,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go build ./... && go test ./...
+      - run: gofmt -l . | tee /dev/stderr | (! read)
+      - run: go vet ./...
+      - run: go test -race ./...

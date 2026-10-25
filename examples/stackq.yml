@@ -1,4 +1,10 @@
 # Copy to .github/workflows/stackq.yml in the repository that uses stacks.
+# Your CI (examples/ci-merge-group.yml) needs merge_group and workflow_dispatch.
+#
+# Token: add a STACKQ_TOKEN secret (fine-grained PAT, or a GitHub App token you
+# mint with actions/create-github-app-token) at the repo or org level. Pushes
+# made with it trigger your CI, and an App can jump the queue. Without one
+# this uses the built-in token, and the last step starts CI on stack branches.
 name: stackq
 
 on:
@@ -22,13 +28,14 @@ on:
         options: [land, after-merge, revert, schedule, tick]
         default: land
       pr:
-        description: PR number (not needed for schedule)
+        description: PR number (not needed for schedule or tick)
         required: false
         default: "0"
 
 permissions:
   contents: write
   pull-requests: write
+  actions: write # to start CI on stack branches
 
 # One stack step at a time, never cancelled halfway through a push.
 concurrency:
@@ -46,21 +53,33 @@ jobs:
       (github.event_name == 'pull_request' && github.event.action != 'labeled' &&
        (github.event.action == 'dequeued' || github.event.pull_request.merged == true))
     runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
     steps:
-      # A GitHub App token, so pushes trigger your CI and the App can jump the queue.
-      # (Or skip this step and use a fine-grained PAT: secrets.STACKQ_TOKEN.)
-      - id: token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ vars.STACKQ_APP_ID }}
-          private-key: ${{ secrets.STACKQ_APP_KEY }}
-
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0 # rebasing needs history; on huge repos add `filter: blob:none`
-          token: ${{ steps.token.outputs.token }}
+          token: ${{ env.TOKEN }}
 
-      - uses: YOUR_ORG/stackq@v0 # wherever you host this repo
+      # Runs the newest stackq release. To pin one, add `version: v0.1.1`
+      # (or use `@v0.1.1`); the release notes list what changed.
+      - uses: YOUR_ORG/stackq@v0
         with:
-          token: ${{ steps.token.outputs.token }}
+          token: ${{ env.TOKEN }}
+
+      # Pushes made with the built-in token do not start pull_request
+      # workflows. Start CI on any stack branch whose current commit has no run.
+      # Harmless when a PAT or an App token is used.
+      - name: Start CI on stack branches
+        env:
+          GH_TOKEN: ${{ env.TOKEN }}
+        run: |
+          gh pr list --state open --json headRefName,headRefOid \
+            --jq '.[] | select(.headRefName | startswith("stack/")) | "\(.headRefName) \(.headRefOid)"' |
+          while read -r branch sha; do
+            seen=$(gh run list --workflow ci.yml --branch "$branch" --json headSha --jq ".[] | select(.headSha == \"$sha\") | .headSha" | head -n1)
+            if [ -z "$seen" ]; then
+              gh workflow run ci.yml --ref "$branch" || true
+            fi
+          done
