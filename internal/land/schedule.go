@@ -161,7 +161,7 @@ func (c *Runner) eligible(p forge.PR, trunk string, stacks map[string]*stackPRs)
 		return false, "checks failing"
 	case d.Checks == "pending":
 		return false, "checks running"
-	case c.Prio.RequireApproval() && len(d.Approvals) == 0:
+	case c.Prio.RequireApproval() && !c.AllowUnreviewed && len(d.Approvals) == 0:
 		return false, "waiting for approval"
 	}
 	return true, ""
