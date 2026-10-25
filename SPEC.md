@@ -760,12 +760,22 @@ Every push to `main` (a merged PR) is tested (`gofmt`, `go vet`, `go test -race`
 | same | `action == labeled` with the pool label | `schedule` |
 | same | anything else | no-op, exit 0 |
 | `pull_request_review`, `workflow_run`, `check_suite`, `schedule` | `autoLand` or the priority pool is on | `tick` (otherwise no-op) |
+
+`tick` does three things in order: `FinishLanded` (tidy stacks whose lander merged without the cleanup running, see below), `AutoLand` (if `autoLand` is on), then the priority pass (if the pool is on).
 | `workflow_dispatch` | `inputs.command` (default `land`; `schedule` and `tick` need no PR), `inputs.pr` (may start with `#`) | that command |
 | anything else | n/a | no-op |
 
 You can also call the steps directly: `stackq ci after-merge|dequeued|land --pr N [--no-enqueue]`.
 
 If git `user.email` is unset, `ci` injects `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` as github-actions[bot]. Rebases preserve the original author.
+
+### 15.3a Why `tick` also finishes landed stacks
+
+GitHub does not start workflows for events caused by the built-in `GITHUB_TOKEN`. When stackq itself queued the lander with that token, the later `merged` and `closed` events are attributed to `github-actions[bot]` (seen on a live run), so the "closed and merged" trigger, and with it `after-merge`, never fires. The parts stay open and the held activation PR keeps pointing at a branch that is gone.
+
+`Runner.FinishLanded` closes that gap. For every open atomic stack whose lander is merged it checks for leftovers: a part that is still open, or the held PR still targeting a stack branch. If there are any it runs `AfterMerge(lander)`, which is idempotent. A held PR that could not be rebased (labeled `stackq:conflict`) is skipped, so a conflict is reported once, not every tick. A tidy stack is left alone.
+
+**With the built-in token, also note:** the merge queue does not run `merge_group` workflows for entries that token added, so the queue merges without CI on the merged result. A GitHub App or PAT (`STACKQ_TOKEN`) avoids both this and the missing cleanup trigger.
 
 ### 15.4 Required repository settings
 

@@ -79,6 +79,16 @@ func (fx *fixture) mainTip(t *testing.T) string {
 // commit, then runs the CI handler in a fresh clone.
 func (fx *fixture) queueLands(t *testing.T, n int, method string) error {
 	t.Helper()
+	fx.mergeWithoutHandler(t, n, method)
+	run := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
+	return run.AfterMerge(n)
+}
+
+// mergeWithoutHandler is queueLands without the CI handler: the merge happened
+// but no "closed and merged" workflow ran, as when the merge is made on behalf
+// of the built-in GITHUB_TOKEN.
+func (fx *fixture) mergeWithoutHandler(t *testing.T, n int, method string) {
+	t.Helper()
 	fx.publishPullRefs(t)
 	pr, _ := fx.f.GetPR(n)
 	ci := testrepo.Clone(t, fx.bare)
@@ -94,8 +104,6 @@ func (fx *fixture) queueLands(t *testing.T, n int, method string) error {
 	}
 	tip := fx.mainTip(t)
 	fx.f.SetDetails(n, func(d *forge.Details) { d.MergeCommit = tip })
-	run := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
-	return run.AfterMerge(n)
 }
 
 // queueMerges simulates the merge queue landing PR i (0-based) with the
@@ -536,5 +544,63 @@ func TestManualLandStillAcceptsPartsWithoutChecks(t *testing.T) {
 	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
 	if err := run.Land(prBy(t, fx, 0).Number); err != nil || len(fx.f.Enqueued) != 1 {
 		t.Fatalf("a person running land can accept parts with no CI: %v %v", err, fx.f.Enqueued)
+	}
+}
+
+func TestFinishLandedCleansUpWhenTheHandlerNeverRan(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	lander := prBy(t, fx, 2)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := run.Land(prBy(t, fx, 0).Number); err != nil {
+		t.Fatal(err)
+	}
+	fx.mergeWithoutHandler(t, lander.Number, "rebase")
+
+	// Nothing ran after the merge: the parts are open, the held PR still targets
+	// a stack branch.
+	if prBy(t, fx, 0).State != "OPEN" || prBy(t, fx, 3).BaseRef == "main" {
+		t.Fatal("test setup: the cleanup must not have run yet")
+	}
+
+	tidy := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
+	if err := tidy.FinishLanded(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if p := prBy(t, fx, i); p.State != "CLOSED" {
+			t.Fatalf("part %d should be closed, is %s", i+1, p.State)
+		}
+	}
+	if h := prBy(t, fx, 3); h.BaseRef != "main" || h.State != "OPEN" || !fx.f.Labels[h.Number][land.LabelActivation] {
+		t.Fatalf("held PR not retargeted to main and left open: base=%s state=%s labels=%v", h.BaseRef, h.State, fx.f.Labels[h.Number])
+	}
+	lc := fx.f.Comments[lander.Number]
+	if !strings.Contains(lc[len(lc)-1], "landed atomically") {
+		t.Fatalf("landing record missing: %q", lc)
+	}
+
+	// A second tick finds nothing to do.
+	before := len(fx.f.Comments[lander.Number])
+	for i := 0; i < 2; i++ {
+		again := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
+		if err := again.FinishLanded(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(fx.f.Comments[lander.Number]); got != before {
+		t.Fatalf("a tidy stack was processed again: %d comments, was %d", got, before)
+	}
+}
+
+func TestFinishLandedLeavesUnlandedStacksAlone(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	run := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin"}
+	if err := run.FinishLanded(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if p := prBy(t, fx, i); p.State != "OPEN" || len(fx.f.Comments[p.Number]) != 0 {
+			t.Fatalf("part %d touched before landing: %s %q", i+1, p.State, fx.f.Comments[p.Number])
+		}
 	}
 }

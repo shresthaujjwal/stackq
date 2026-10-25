@@ -195,6 +195,74 @@ func (c *Runner) AutoLand() error {
 	return errors.Join(errs...)
 }
 
+// FinishLanded cleans up every atomic stack whose lander has merged but whose
+// parts or held PR were never tidied: it runs AfterMerge for the lander. A
+// merge made by the merge queue or auto-merge on behalf of the built-in
+// GITHUB_TOKEN does not start the "PR closed and merged" workflow (GitHub does
+// not run workflows for events that token causes), so without this the parts
+// stay open and the held PR keeps pointing at a deleted branch. Safe to run on
+// every tick: once a stack is tidy it does nothing.
+func (c *Runner) FinishLanded() error {
+	open, err := c.Forge.ListPRs("open")
+	if err != nil {
+		return err
+	}
+	byName := map[string]stack.Marker{}
+	var names []string
+	for _, p := range open {
+		m, ok := stack.ParseMarker(p.Body)
+		if !ok || !m.Atomic() {
+			continue
+		}
+		if _, dup := byName[m.Stack]; !dup {
+			byName[m.Stack] = m
+			names = append(names, m.Stack)
+		}
+	}
+	sort.Strings(names)
+
+	// A held PR that could not be rebased is already labeled and commented;
+	// don't report the same conflict on every tick.
+	conflicted := map[int]bool{}
+	if pool, err := c.Forge.ListPool(LabelConflict); err == nil {
+		for _, p := range pool {
+			conflicted[p.Number] = true
+		}
+	}
+
+	var errs []error
+	for _, name := range names {
+		sp, err := c.loadStack(name)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		lander, ok := sp.lander()
+		if !ok || !lander.Merged() {
+			continue
+		}
+		pending := false
+		for _, p := range sp.prs {
+			pm := sp.marks[p.Number]
+			switch {
+			case !p.Open() || p.Number == lander.Number:
+			case !pm.Hold:
+				pending = true // a part that should have been closed
+			case p.BaseRef != pm.Trunk && !conflicted[p.Number]:
+				pending = true // the held PR still targets a stack branch
+			}
+		}
+		if !pending {
+			continue
+		}
+		c.logf("- stack %s: #%d merged but its cleanup never ran; finishing it", name, lander.Number)
+		if err := c.AfterMerge(lander.Number); err != nil {
+			errs = append(errs, fmt.Errorf("stack %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // queued reports whether GitHub's queue for trunk already holds PR n.
 func (c *Runner) queued(n int, trunk string) bool {
 	q, err := c.Forge.Queue(trunk)

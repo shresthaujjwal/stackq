@@ -155,6 +155,8 @@ To split from GitHub instead of a laptop, copy `examples/stackq-split.yml`. Labe
 
 **Landing by itself.** Set `"autoLand": true` in `.stackq.json` and an atomic stack lands as soon as the last part is approved and green. The workflow checks on every review, finished CI run and the 5-minute timer; a stack that isn't ready is left alone quietly, and one that is already landing is not queued twice.
 
+**Built-in token vs. an App or PAT.** The Action works with just `GITHUB_TOKEN`, with two limits that come from GitHub, not from stackq: events that token causes do not start workflows, and the merge queue does not run `merge_group` workflows for entries it added. stackq works around the first (the timer pass tidies a landed stack and a step starts CI on stack branches), but the second means the queue merges without CI on the merged result; each part's CI has already passed, so this is safe unless `main` moved in between. Give stackq a GitHub App token or a PAT as `STACKQ_TOKEN` to get queue CI and immediate cleanup.
+
 Manual controls, through workflow_dispatch or locally:
 
 ```sh
