@@ -1612,6 +1612,20 @@ Reviews and checks come from `Forge.Details`: `gh pr view --json latestReviews,s
 5. **Note it on the original PR** (§12.1): "landed atomically via #L", plus any waiting activation PR.
 6. **Refresh the nav** on every open PR. Closed-as-landed parts show ✅.
 
+### 28.3a Landing status on the lander
+
+Automatic landing is quiet by design: a stack that is not ready gets no comment or label. So that people do not have to read Actions logs to see why it waits, the lander's description carries a status section, managed separately from the stack block (`<!-- stackq:status:begin -->` … `<!-- stackq:status:end -->`, placed right after it, so restacks that rewrite the stack block keep it):
+
+| State | Shown |
+|---|---|
+| Not ready | ⏳ the gate's problems, one line per part (`part 2 #42: checks are still running`) |
+| In the priority pool | ⧗ waiting for a merge-queue slot |
+| Queued, or auto-merge pending | 🚀 landing as one entry |
+| Left the queue | ⏸ paused, with what to do |
+| Landed | removed (the landing comment is the record) |
+
+It is written only when its text changes, so a tick that finds nothing new makes no API call for it.
+
 ### 28.4 Safety nets in atomic mode
 
 - **A part merged on its own** by mistake: CI rebases the next part onto trunk *and cascades*, rebasing every part above it so the chain stays intact. It queues nothing, and comments a warning. `stackq land` then lands the remainder together.

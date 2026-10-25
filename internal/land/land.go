@@ -319,33 +319,70 @@ func (c *Runner) labeled(n int, label string) bool {
 	return false
 }
 
-// leftQueue reports whether a lander that targets trunk is no longer on its
-// way in: not in the merge queue, not waiting in the priority pool, no
-// auto-merge pending, and not merged. GitHub sends a dequeued event when the
-// queue drops a PR, but the run for it can be lost: the workflows share one
-// concurrency group, and a newer pending run replaces an older one. Without
-// this check such a stack would be reported as landing forever. Any doubt
-// (the queue cannot be read, a lookup fails) counts as still landing.
-func (c *Runner) leftQueue(lander forge.PR, trunk string) bool {
+// Where a lander that targets trunk stands, as landingState reports it.
+const (
+	stateQueued    = "queued"     // in the merge queue
+	statePool      = "pool"       // waiting in the priority pool
+	stateAutoMerge = "auto-merge" // auto-merge on, waiting for its requirements
+	stateGone      = "gone"       // none of the above, and not merged
+	stateUnknown   = "unknown"    // could not tell
+)
+
+// landingState reports where a lander that targets trunk stands. GitHub sends
+// a dequeued event when the queue drops a PR, but the run for it can be lost:
+// the workflows share one concurrency group, and a newer pending run replaces
+// an older one. stateGone lets the next tick notice. Any doubt (the queue
+// cannot be read, a lookup fails, the PR merged meanwhile) is stateUnknown.
+func (c *Runner) landingState(lander forge.PR, trunk string) string {
 	if c.prioOn() && c.labeled(lander.Number, c.Prio.Label) {
-		return false
+		return statePool
 	}
 	q, err := c.Forge.Queue(trunk)
 	if err != nil {
-		return false
+		return stateUnknown
 	}
 	for _, e := range q {
 		if e.PR == lander.Number {
-			return false
+			return stateQueued
 		}
 	}
 	d, err := c.Forge.Details(lander.Number)
-	if err != nil || d.AutoMerge || d.MergeCommit != "" {
-		return false
+	switch {
+	case err != nil || d.MergeCommit != "":
+		return stateUnknown
+	case d.AutoMerge:
+		return stateAutoMerge
 	}
 	// Last, so a merge that happened while we looked is seen.
-	pr, err := c.Forge.GetPR(lander.Number)
-	return err == nil && pr.Open()
+	if pr, err := c.Forge.GetPR(lander.Number); err != nil || !pr.Open() {
+		return stateUnknown
+	}
+	return stateGone
+}
+
+// setStatus writes the landing status into the PR's body (stack.MergeStatus),
+// and only when it changed, so a tick that finds nothing new makes no call. An
+// empty status removes it.
+func (c *Runner) setStatus(pr forge.PR, status string) {
+	body := stack.MergeStatus(pr.Body, status)
+	if body == pr.Body {
+		return
+	}
+	if err := c.Forge.EditPR(pr.Number, nil, &body); err != nil {
+		c.logf("! could not update the landing status on #%d: %v", pr.Number, err)
+	}
+}
+
+func statusWaiting(problems []string) string {
+	return "⏳ **Not landing yet.** The stack lands as one entry once nothing below is left:\n\n- " + strings.Join(problems, "\n- ")
+}
+
+func statusLanding(parts int) string {
+	return fmt.Sprintf("🚀 **Landing.** This PR carries all %d parts into the merge queue as one entry.", parts)
+}
+
+func statusPool(parts int) string {
+	return fmt.Sprintf("⧗ **Waiting in the priority pool** for a merge-queue slot. This PR carries all %d parts.", parts)
 }
 
 // attemptAtomic gates and queues an atomic stack. With auto set it is quiet:
@@ -381,15 +418,22 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 	lander := parts[len(parts)-1]
 	// Once the lander targets trunk the stack is landing; don't queue it twice.
 	if auto && lander.BaseRef == m.Trunk && (len(parts) > 1 || c.queued(lander.Number, m.Trunk)) {
-		switch {
-		case c.labeled(lander.Number, LabelBlocked):
+		if c.labeled(lander.Number, LabelBlocked) {
 			c.logf("- stack %s is paused: #%d is labeled %s; fix it, then run stackq land --pr %d", m.Stack, lander.Number, LabelBlocked, lander.Number)
-		case len(parts) > 1 && c.leftQueue(lander, m.Trunk):
-			c.logf("! #%d left the merge queue without merging, and no dequeued run handled it", lander.Number)
-			return c.Dequeued(lander.Number)
-		default:
-			c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
+			return nil
 		}
+		switch c.landingState(lander, m.Trunk) {
+		case stateGone:
+			if len(parts) > 1 {
+				c.logf("! #%d left the merge queue without merging, and no dequeued run handled it", lander.Number)
+				return c.Dequeued(lander.Number)
+			}
+		case statePool:
+			c.setStatus(lander, statusPool(len(parts)))
+		case stateQueued, stateAutoMerge:
+			c.setStatus(lander, statusLanding(len(parts)))
+		}
+		c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
 		return nil
 	}
 
@@ -451,6 +495,7 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 	}
 	if len(problems) > 0 && auto {
 		c.logf("- stack %s is not ready to land: %s", m.Stack, strings.Join(problems, "; "))
+		c.setStatus(lander, statusWaiting(problems))
 		return nil
 	}
 	if len(problems) > 0 {
@@ -493,8 +538,10 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 	}
 	if queued {
 		c.logf("⇢ #%d carries the whole stack (%d parts) into the queue", lander.Number, len(parts))
+		c.setStatus(lander, statusLanding(len(parts)))
 	} else {
 		c.logf("⧗ #%d carries the whole stack (%d parts) and stays in the priority pool until a pass queues it", lander.Number, len(parts))
+		c.setStatus(lander, statusPool(len(parts)))
 	}
 	return nil
 }
@@ -723,6 +770,7 @@ func (c *Runner) finishAtomic(sp *stackPRs, lander forge.PR, m stack.Marker, chi
 		c.logf("✕ closed #%d (landed inside #%d)", p.Number, lander.Number)
 	}
 	c.Forge.RemoveLabels(lander.Number, LabelLanding, LabelBlocked)
+	c.setStatus(lander, "")
 
 	if !c.KeepBranches {
 		// The lander's branch is the base of held PRs until they are
@@ -849,6 +897,8 @@ func (c *Runner) Dequeued(n int) error {
 	c.Forge.Comment(n, fmt.Sprintf("⏸️ This PR left the merge queue without merging, so stack `%s` is paused here; %s.\n\n"+
 		"Fix the failure, push, then run `stackq land --pr %d` (or the stackq workflow with command `land`).", m.Stack, what, n))
 	c.Forge.AddLabels(n, LabelBlocked)
+	c.setStatus(pr, fmt.Sprintf("⏸ **Paused.** This PR left the merge queue without merging; %s. "+
+		"Fix the failure, push, then run `stackq land --pr %d`.", what, n))
 	c.logf("⏸ #%d left the queue; stack %s paused", n, m.Stack)
 	return nil
 }

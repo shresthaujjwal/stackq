@@ -133,3 +133,32 @@ func MergeBody(existing, block string) string {
 	}
 	return strings.TrimRight(existing, "\n") + "\n\n" + block
 }
+
+const (
+	statusBegin = "<!-- stackq:status:begin -->"
+	statusEnd   = "<!-- stackq:status:end -->"
+)
+
+// MergeStatus puts status in its own managed section of a PR body, after the
+// stack block, replacing any earlier status. An empty status removes the
+// section. The stack block is rewritten on every restack, so the status lives
+// outside it.
+func MergeStatus(body, status string) string {
+	i := strings.Index(body, statusBegin)
+	j := strings.Index(body, statusEnd)
+	if i >= 0 && j > i {
+		body = strings.TrimRight(body[:i], "\n") + body[j+len(statusEnd):]
+	}
+	if status == "" {
+		return body
+	}
+	section := statusBegin + "\n" + strings.TrimSpace(status) + "\n" + statusEnd
+	if k := strings.Index(body, blockEnd); k >= 0 {
+		k += len(blockEnd)
+		return body[:k] + "\n\n" + section + body[k:]
+	}
+	if strings.TrimSpace(body) == "" {
+		return section
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + section
+}

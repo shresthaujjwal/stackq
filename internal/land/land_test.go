@@ -3,6 +3,7 @@ package land_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -564,6 +565,57 @@ func TestAutoLandPausesALanderThatSilentlyLeftTheQueue(t *testing.T) {
 	}
 	if fx.f.Labels[lander.Number][land.LabelBlocked] || len(fx.f.Enqueued) != 2 {
 		t.Fatalf("manual land did not resume: labels=%v queued=%v", fx.f.Labels[lander.Number], fx.f.Enqueued)
+	}
+}
+
+// The reason a stack waits shows on the lander itself, not only in the
+// Actions log, and is rewritten as the stack moves.
+func TestLanderBodyShowsTheLandingStatus(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	lander, part2 := prBy(t, fx, 2), prBy(t, fx, 1)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	body := func() string { t.Helper(); return prBy(t, fx, 2).Body }
+	tick := func() {
+		t.Helper()
+		if err := run.AutoLand(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "pending" })
+	tick()
+	if b := body(); !strings.Contains(b, "Not landing yet") || !strings.Contains(b, fmt.Sprintf("#%d: checks are still running", part2.Number)) {
+		t.Fatalf("waiting reason missing from the lander:\n%s", b)
+	}
+	if strings.Count(body(), "stackq:status:begin") != 1 || !strings.Contains(body(), "stackq:meta") {
+		t.Fatalf("status must sit beside the stack block, once:\n%s", body())
+	}
+	if len(fx.f.Comments[lander.Number]) != 0 {
+		t.Fatalf("waiting must not comment: %q", fx.f.Comments[lander.Number])
+	}
+
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "success" })
+	tick()
+	if b := body(); !strings.Contains(b, "Landing.") || strings.Contains(b, "Not landing yet") {
+		t.Fatalf("status not updated when the stack was queued:\n%s", b)
+	}
+
+	fx.f.MQ = nil // dropped without a dequeued run
+	tick()
+	if b := body(); !strings.Contains(b, "Paused.") {
+		t.Fatalf("pause not shown:\n%s", b)
+	}
+
+	if err := run.Land(lander.Number); err != nil {
+		t.Fatal(err)
+	}
+	fx.mergeWithoutHandler(t, lander.Number, "rebase")
+	tidy := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
+	if err := tidy.FinishLanded(); err != nil {
+		t.Fatal(err)
+	}
+	if b := body(); strings.Contains(b, "stackq:status") || !strings.Contains(b, "stackq:meta") {
+		t.Fatalf("status left behind after landing:\n%s", b)
 	}
 }
 
