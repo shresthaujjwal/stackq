@@ -50,7 +50,9 @@ def history(prev):
     rng = f"{prev}..HEAD" if prev else "HEAD"
     out = git("log", "--first-parent", "--format=%H%x1f%s%x1f%b%x1e", rng)
     entries = []
-    for rec in filter(None, out.split("\x1e")):
+    for rec in out.split("\x1e"):
+        if not rec.strip():  # the text after the last separator
+            continue
         sha, subject, body = (rec.strip("\n").split("\x1f") + ["", ""])[:3]
         m = re.match(r"Merge pull request #(\d+)", subject) or re.search(r"\(#(\d+)\)$", subject)
         entries.append((sha, subject, body.strip(), int(m.group(1)) if m else None))
