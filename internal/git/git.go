@@ -27,22 +27,31 @@ type Repo struct {
 // networkCommands talk to the remote and so need credentials.
 var networkCommands = map[string]bool{"fetch": true, "push": true, "pull": true, "clone": true, "ls-remote": true}
 
-// authEnvFor returns the environment that lets one git process authenticate to
-// the GitHub server with the job's token, or nil if nothing is needed.
+// authEnvFor returns the extra environment for one git process while the job
+// has a token, or nil when it has none.
 //
-// actions/checkout normally writes the token into .git/config, where every later
-// command in the job can read it, including the build-check command from
+// For a command that talks to the remote (network) it lets git authenticate to
+// the GitHub server with the token instead of storing it in .git/config, where
+// any later command could read it, including the build check from
 // .stackq.json. With `persist-credentials: false` nothing is stored, and the
 // token reaches only the git process that talks to the remote, scoped to the
 // server's URL. Credentials a checkout already stored are left alone: sending a
-// second Authorization header would break the request. Config entries passed
-// through GIT_CONFIG_COUNT are kept; ours is added after them.
-func authEnvFor(getenv func(string) string, persisted bool) []string {
+// second Authorization header would break the request.
+//
+// For every command it also turns off what the repository config can make git
+// run: hooks, an fsmonitor program and credential helpers. The check command
+// runs in a worktree of this repository and can write that config; nothing it
+// set up should run while a process holding the token is its ancestor (a child
+// can read its parents' environment from /proc).
+//
+// Config entries passed through GIT_CONFIG_COUNT are kept; ours are added after
+// them.
+func authEnvFor(getenv func(string) string, network, persisted bool) []string {
 	token := getenv("GH_TOKEN")
 	if token == "" {
 		token = getenv("GITHUB_TOKEN")
 	}
-	if token == "" || persisted {
+	if token == "" {
 		return nil
 	}
 	// Add to config entries the environment already carries instead of
@@ -54,34 +63,46 @@ func authEnvFor(getenv func(string) string, persisted bool) []string {
 			return nil
 		}
 	}
-	server := strings.TrimRight(getenv("GITHUB_SERVER_URL"), "/")
-	if server == "" {
-		server = "https://github.com"
+	var entries [][2]string
+	if network && !persisted {
+		server := strings.TrimRight(getenv("GITHUB_SERVER_URL"), "/")
+		if server == "" {
+			server = "https://github.com"
+		}
+		cred := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+		entries = append(entries, [2]string{"http." + server + "/.extraheader", "AUTHORIZATION: basic " + cred})
 	}
-	cred := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
-	return []string{
-		fmt.Sprintf("GIT_CONFIG_COUNT=%d", n+1),
-		fmt.Sprintf("GIT_CONFIG_KEY_%d=http.%s/.extraheader", n, server),
-		fmt.Sprintf("GIT_CONFIG_VALUE_%d=AUTHORIZATION: basic %s", n, cred),
+	entries = append(entries,
+		[2]string{"core.hooksPath", os.DevNull},
+		[2]string{"core.fsmonitor", "false"},
+		[2]string{"credential.helper", ""},
+	)
+	env := []string{fmt.Sprintf("GIT_CONFIG_COUNT=%d", n+len(entries))}
+	for i, e := range entries {
+		env = append(env, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", n+i, e[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", n+i, e[1]))
 	}
+	return env
 }
 
 // authEnv is authEnvFor for a git invocation in this repository.
 func (r *Repo) authEnv(args []string) []string {
-	if len(args) == 0 || !networkCommands[args[0]] || (os.Getenv("GH_TOKEN") == "" && os.Getenv("GITHUB_TOKEN") == "") {
+	if len(args) == 0 || (os.Getenv("GH_TOKEN") == "" && os.Getenv("GITHUB_TOKEN") == "") {
 		return nil
 	}
-	r.authOnce.Do(func() {
-		server := strings.TrimRight(os.Getenv("GITHUB_SERVER_URL"), "/")
-		if server == "" {
-			server = "https://github.com"
-		}
-		cmd := exec.Command("git", "config", "--get-all", "http."+server+"/.extraheader")
-		cmd.Dir = r.Dir
-		out, _ := cmd.Output()
-		r.persisted = len(bytes.TrimSpace(out)) > 0
-	})
-	return authEnvFor(os.Getenv, r.persisted)
+	network := networkCommands[args[0]]
+	if network {
+		r.authOnce.Do(func() {
+			server := strings.TrimRight(os.Getenv("GITHUB_SERVER_URL"), "/")
+			if server == "" {
+				server = "https://github.com"
+			}
+			cmd := exec.Command("git", "config", "--get-all", "http."+server+"/.extraheader")
+			cmd.Dir = r.Dir
+			out, _ := cmd.Output()
+			r.persisted = len(bytes.TrimSpace(out)) > 0
+		})
+	}
+	return authEnvFor(os.Getenv, network, r.persisted)
 }
 
 // Error carries the failing command and its stderr.

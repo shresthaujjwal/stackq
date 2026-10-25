@@ -81,7 +81,10 @@ runs:
     - name: Run stackq
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.token }}
+        # split and plan run the check command from .stackq.json on the branch
+        # being split and make no GitHub calls, so they get no token: a child
+        # process can read its parents' environment from /proc.
+        GH_TOKEN: ${{ !(inputs.command == 'split' || inputs.command == 'plan') && inputs.token || '' }}
         STACKQ_COMMAND: ${{ inputs.command }}
         STACKQ_ARGS: ${{ inputs.args }}
       run: |
