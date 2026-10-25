@@ -74,7 +74,7 @@ func healthyFiles() map[string]string {
 	return map[string]string{"stackq.yml": stackqYML, "stackq-split.yml": splitYML, "ci.yml": ciYML}
 }
 
-var cfg = Config{Trunk: "main", Prefix: "stack/{name}/", Landing: "atomic", AutoLand: true, Priority: true}
+var cfg = Config{Trunk: "main", Prefix: "stack/{name}/", Landing: "atomic", AutoLand: true, Priority: true, QueueCI: "ci.yml"}
 
 func levels(rs []Result, l Level) []string {
 	var out []string
@@ -169,5 +169,26 @@ func TestConfigProblems(t *testing.T) {
 	got := strings.Join(levels(checkConfig(bad), Fail), "\n")
 	if !strings.Contains(got, "has no {name}") || !strings.Contains(got, "is not atomic or incremental") {
 		t.Fatalf("config problems not reported: %q", got)
+	}
+}
+
+func TestQueueCI(t *testing.T) {
+	noQueueCI := cfg
+	noQueueCI.QueueCI = ""
+	rs := Run(healthy(), repoWith(t, healthyFiles()), noQueueCI)
+	if got := strings.Join(levels(rs, Warn), "\n"); !strings.Contains(got, "queueCI is not set") {
+		t.Fatalf("required checks without queueCI must warn: %q", got)
+	}
+	missing := cfg
+	missing.QueueCI = "build.yml"
+	rs = Run(healthy(), repoWith(t, healthyFiles()), missing)
+	if got := strings.Join(levels(rs, Fail), "\n"); !strings.Contains(got, "build.yml, which is not in .github/workflows") {
+		t.Fatalf("a queueCI file that does not exist must fail: %q", got)
+	}
+	files := healthyFiles()
+	files["ci.yml"] = strings.Replace(ciYML, "  workflow_dispatch:\n", "", 1)
+	rs = Run(healthy(), repoWith(t, files), cfg)
+	if got := strings.Join(levels(rs, Fail), "\n"); !strings.Contains(got, "(queueCI) has no workflow_dispatch trigger") {
+		t.Fatalf("queueCI without workflow_dispatch must fail: %q", got)
 	}
 }

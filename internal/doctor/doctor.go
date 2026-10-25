@@ -51,6 +51,7 @@ type Config struct {
 	Landing  string
 	AutoLand bool
 	Priority bool
+	QueueCI  string // workflow file stackq starts on the merge queue's branch
 }
 
 // Run makes every check. dir is the repository's top level.
@@ -60,7 +61,7 @@ func Run(api API, dir string, cfg Config) []Result {
 	rs = append(rs, checkRepo(api, cfg)...)
 	rs = append(rs, checkRules(api, cfg)...)
 	rs = append(rs, checkActions(api)...)
-	rs = append(rs, checkWorkflows(dir)...)
+	rs = append(rs, checkWorkflows(dir, cfg.QueueCI)...)
 	rs = append(rs, checkLabels(api)...)
 	return rs
 }
@@ -218,6 +219,10 @@ func checkRules(api API, cfg Config) []Result {
 	} else {
 		sort.Strings(checks)
 		rs = append(rs, ok("required checks on "+cfg.Trunk+": "+strings.Join(checks, ", ")))
+		if cfg.QueueCI == "" {
+			rs = append(rs, warn("queueCI is not set",
+				`with the built-in token the merge queue starts no CI for stackq's entries, so a required check never reports and the entry times out; set "queueCI" to your CI workflow file (or give stackq a STACKQ_TOKEN)`))
+		}
 	}
 	return rs
 }
@@ -274,7 +279,7 @@ var (
 
 // checkWorkflows reads .github/workflows as text. It looks for what stackq
 // needs rather than validating YAML.
-func checkWorkflows(dir string) []Result {
+func checkWorkflows(dir, queueCI string) []Result {
 	files, _ := filepath.Glob(filepath.Join(dir, ".github", "workflows", "*.y*ml"))
 	text := map[string]string{}
 	for _, f := range files {
@@ -296,6 +301,16 @@ func checkWorkflows(dir string) []Result {
 		}
 	}
 	var rs []Result
+	if queueCI != "" {
+		switch t, found := text[queueCI]; {
+		case !found:
+			rs = append(rs, fail("queueCI names "+queueCI+", which is not in .github/workflows", `set "queueCI" to your CI workflow's file name`))
+		case !strings.Contains(t, "workflow_dispatch"):
+			rs = append(rs, fail(queueCI+" (queueCI) has no workflow_dispatch trigger", "stackq starts it on the merge queue's branch through workflow_dispatch"))
+		default:
+			rs = append(rs, ok("queueCI: stackq starts "+queueCI+" on the merge queue's branch"))
+		}
+	}
 	if landing == "" {
 		return append(rs, fail("no workflow runs stackq on finished CI runs", "copy examples/stackq.yml into .github/workflows/"))
 	}

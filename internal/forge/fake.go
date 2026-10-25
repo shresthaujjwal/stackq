@@ -32,6 +32,12 @@ type Fake struct {
 	PoolLag bool
 	// HeadSHA resolves a branch to its current tip so open PRs track pushes.
 	HeadSHA func(branch string) string
+	// OnEnqueue runs after a PR joins MQ, as GitHub builds its merge group.
+	OnEnqueue func(PR)
+	// CI is the check verdict per commit for CommitChecks (default none).
+	CI map[string]string
+	// Started records StartCI calls as "workflow@ref".
+	Started []string
 }
 
 func NewFake() *Fake {
@@ -137,6 +143,16 @@ func (f *Fake) EditPR(n int, base, body *string) error {
 }
 
 func (f *Fake) Enqueue(pr PR, o EnqueueOptions) error {
+	if err := f.enqueue(pr, o); err != nil {
+		return err
+	}
+	if f.OnEnqueue != nil {
+		f.OnEnqueue(pr)
+	}
+	return nil
+}
+
+func (f *Fake) enqueue(pr PR, o EnqueueOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.EnqueueErr != nil {
@@ -266,4 +282,20 @@ func (f *Fake) MarkMerged(n int) {
 		f.refresh(p)
 		p.State = "MERGED"
 	}
+}
+
+func (f *Fake) CommitChecks(sha string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if v, ok := f.CI[sha]; ok {
+		return v, nil
+	}
+	return "none", nil
+}
+
+func (f *Fake) StartCI(workflow, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Started = append(f.Started, workflow+"@"+ref)
+	return nil
 }
