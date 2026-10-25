@@ -196,7 +196,7 @@ Patterns follow gitignore semantics:
 - **API-level coupling.** The import graph can't see that a package's exported types changed under its callers (for example a function that now returns a renamed type). `--check` catches it by folding the failing slice into the next one, which can pull unrelated slices along. Add a `slices` rule naming the coupled packages so only they ship together.
 - **Import resolution.** TS path aliases (`@/…`) and bare package imports are not resolved. Use `slices` rules or `--check` to keep those orders right.
 - **Squash merges.** Local `stackq sync` detects landed branches by patch equivalence (`git cherry`). That works for rebase and merge commits, but not squash. The CI restack works with every merge method, because it cuts at the parent's recorded pre-merge head.
-- **Atomic mode needs live verification.** It has been tested against a fake GitHub only. On real GitHub, check how CODEOWNERS and approval rules treat the retargeted top PR, and make sure CI runs on PRs targeting `stack/**` branches. See SPEC §28.6.
+- **Atomic mode is verified end to end on live GitHub** (built-in token only), but not with required approvals or CODEOWNERS on the retargeted top PR: the sandbox used `allowUnreviewed`. Check how those rules treat the lander, and make sure CI runs on PRs targeting `stack/**` branches. See SPEC §28.6.
 - **Incremental mode** takes one queue run per PR, since PRs that don't target `main` can't be queued.
 - **Guard lint** covers Go only, and is a lint, not a proof (SPEC §29.3).
 
@@ -233,4 +233,4 @@ The tests build real repositories with a bare `origin` and a fake GitHub:
 - **Rollback.** `stackq revert` restores the pre-stack tree for rebase, merge-commit and squash merges, keeping later unrelated changes.
 - **Failures.** Approval and check gates, stray merges of one part, conflicts, enqueue failures, and dequeues.
 
-The `gh` and GraphQL calls (`enqueuePullRequest`, falling back to `enablePullRequestAutoMerge`) are not exercised against live GitHub by the tests. Do a first real run on a small throwaway stack.
+The unit tests use a fake GitHub. The `gh` and GraphQL calls (`enqueuePullRequest`, falling back to `enablePullRequestAutoMerge`) were exercised on live GitHub in a sandbox repo, but do a first real run on a small throwaway stack in your own repo. Use the `permissions:` block from `examples/stackq.yml` as is: it includes `checks: read` and `statuses: read`, without which every PR looks as if it had no checks.

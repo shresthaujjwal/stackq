@@ -836,7 +836,7 @@ All calls run `gh` with `GH_REPO` set if `Repo` is set. `GH_TOKEN` comes from th
 
 Label colors: `stackq:conflict` is `d73a4a` (red) and `stackq:blocked` is `fbca04` (yellow).
 
-**None of these calls has been exercised against live GitHub.** See §24, issue K0.
+**Verified on live GitHub (2026-10-25, sandbox repo, built-in `GITHUB_TOKEN` only):** `gh pr list/view` JSON including `id` and `isCrossRepository`, label and comment writes, PR create/retarget/close, the `enqueuePullRequest` path and the resulting merge-queue entry, and `statusCheckRollup`. Not verified: the `dequeued` event and the exact `enqueuePullRequest` error text (the fallback to auto-merge now logs why it fell back). See §24, issue K0.
 
 ### 16.3 Fake (`forge.Fake`)
 
@@ -1092,7 +1092,7 @@ All tests use real git with temporary repositories. A bare repo plays the remote
 
 Issues (K) are bugs or rough edges; gaps (G) are missing features.
 
-- **K0, highest priority: never run against live GitHub.**
+- **K0. Live GitHub: mostly verified (2026-10-25); remaining items below.** Two live findings: the PR's `statusCheckRollup` omits check runs started by `workflow_dispatch`, so checks are now read from the head commit through the REST API; and a workflow with an explicit `permissions:` block needs `checks: read` and `statuses: read` or every PR looks checkless.
   - Validate `gh pr list --head` behavior.
   - Validate the `id` JSON field.
   - Validate GraphQL argument typing (`-f oid=` passed as a string for `GitObjectID`).
@@ -1104,8 +1104,8 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
 - **K3. Merged-PR history is capped at the 200 most recent.** Older merged stack PRs lose their ✅ in the nav. This is cosmetic. Fix it by fetching specific PR numbers recorded in the markers, or with a search query.
 - **K4. `--check` artifacts carry over.** Untracked artifacts from one slice's check persist into the next slice's check, which could mask failures (for example, generated code). Fix by running `git clean -fdx` (optional, configurable) before each check, or by running checks in a fresh worktree per slice.
 - **K5. The marker trunk is unvalidated in CI** (§22).
-- **K11. Atomic mode on live GitHub is unverified.** In particular: whether retargeting the lander keeps existing approvals, how CODEOWNERS review applies to the lander's full diff, and whether checks run on stacked PRs at all (§28.6).
-- **K13. Priority on live GitHub is unverified:** the `mergeQueue` GraphQL shape, `jump` permissions, and whether a pass triggered by Dependabot can read secrets (§31.7).
+- **K11. Atomic mode on live GitHub: verified end to end** (8-part stack: split, push, CI, retarget of the lander, one queue entry, 7 rebased per-part commits on trunk, parts closed, branches deleted, activation PR left as an unmerged draft). Still unverified because the sandbox used `allowUnreviewed`: whether retargeting keeps existing approvals, and how CODEOWNERS review applies to the lander's full diff (§28.6).
+- **K13. Priority on live GitHub: the `mergeQueue` GraphQL shape and the pool pass are verified** (2026-10-25). Still unverified: `jump` permissions, and whether a pass triggered by Dependabot can read secrets (§31.7).
 - **K12. Revert relies on `refs/pull/N/head`** to find a PR's commits after its branch is deleted. GitHub keeps these refs, but forks and some mirrors don't.
 - **K6. `--force` deletion of prefix branches** fails if any of them is checked out; the error is the raw git error.
 - **K7. One global concurrency group** serializes all stacks in the repo. Use `stackq-${{ head ref's stack name }}` instead; that needs the stack name, so derive it from the branch prefix.
@@ -1550,7 +1550,7 @@ Phases A and B are pure engineering and strengthen v0 on their own. They should 
 
 ## 28. Atomic landing and rollback
 
-Status: **implemented** (2026-10-16), and the default for new stacks. Tested against the fake GitHub; not yet on live GitHub (K11).
+Status: **implemented** (2026-10-16), and the default for new stacks. Tested against the fake GitHub and, since 2026-10-25, end to end on live GitHub; approvals and CODEOWNERS on the lander are still unverified (K11).
 
 ### 28.1 Why
 
@@ -1632,7 +1632,7 @@ In CI this is available as `stackq ci revert --pr N` and as the workflow_dispatc
 
 **Re-landing after a revert** is not automated yet (§30.12). For now, revert the revert PR.
 
-### 28.6 Caveats to verify on live GitHub (K11)
+### 28.6 Caveats (K11; checks on stacked PRs verified live, the rest still to verify)
 
 - **CODEOWNERS on the lander.** Once retargeted, the lander's diff covers every file in the stack, and required code-owner reviews are evaluated on that diff. Owners who approved a lower part may need to approve the lander too. Options:
   1. request their review automatically at land time (planned),
@@ -1817,7 +1817,7 @@ Suggested order to build, after the P0 live test:
 
 ## 31. PR priority in the merge queue
 
-Status: **implemented** (2026-10-16). Tested against the fake GitHub; the GraphQL queue query and `jump` are not yet tried on live GitHub (K13).
+Status: **implemented** (2026-10-16). Tested against the fake GitHub; the GraphQL queue query and the pool pass are verified on live GitHub, `jump` is not (K13).
 
 ### 31.1 The problem
 
