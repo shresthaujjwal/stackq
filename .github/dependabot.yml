@@ -1,0 +1,8 @@
+# Actions are pinned to commit SHAs (a tag can be moved to different code).
+# Dependabot opens a PR when a newer release exists, with the changelog.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

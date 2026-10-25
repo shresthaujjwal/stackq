@@ -1001,17 +1001,28 @@ stateDiagram-v2
 
 ## 22. Security model
 
-- **The token** can push to any branch it's allowed to and edit PRs. Restrict it with branch protection. The trunk is protected by the queue anyway; stackq only pushes `stack/*` branches.
-- **Untrusted input.** PR bodies are user-controlled. The marker is parsed as JSON into fixed fields, and its values are used only as:
-  - a stack name, compared for equality,
-  - a parent branch name, compared for equality,
-  - a trunk name, used in `git fetch` refspecs, `git push` refspecs and `gh pr edit --base`.
+**What an attacker wants:** the token the workflow runs with (it can push branches, edit PRs and, through the queue, change `main`), or a way to get their own code onto `main`.
 
-  All git invocations pass arguments as an argv array, never through a shell. A malicious marker could still name a weird trunk such as `refs/heads/x`. **Hardening TODO:** validate `marker.trunk` against the repo's default branch, or against config, in CI (§24, K5).
-- **Expression injection.** The Action passes `args` through an environment variable, not `${{ }}` inside `run:`.
-- **Forks.** The workflow uses `pull_request`, so fork PRs get a read-only token and no secrets; they would fail harmlessly. Stack branches are expected to be same-repo. Do not switch to `pull_request_target` without re-reviewing this.
+### What stackq enforces
+
+- **A PR body proves nothing.** Anyone can open a PR, from a fork of a public repo, with any body, including a copied stack marker with a higher index. Before this was enforced such a PR became the stack's lander and stackq retargeted and queued it. Every read of a marker goes through `Runner.markerOf`, which accepts a PR only if its head branch is in this repository (`isCrossRepository` is false) and is named like stackq names stack branches (the config `prefix`, `stack/{name}/` by default). The marker's values are then used only as a stack name and a branch name compared for equality, and a trunk name in refspecs and `gh pr edit --base`; every git call passes arguments as an argv array, never through a shell. *Open:* validate `marker.trunk` against the default branch (K5).
+- **The build check is untrusted code.** `check` comes from `.stackq.json` on the branch being split. It runs without `GH_TOKEN`, `GITHUB_TOKEN`, `STACKQ_TOKEN` or the Actions runtime/OIDC tokens in its environment.
+- **The token is not left on disk.** `actions/checkout` stores its token in `.git/config` unless told not to, where any later command can read it. With `persist-credentials: false`, stackq hands the token to git only for `fetch`, `push`, `pull`, `clone` and `ls-remote`, as an `http.<server>/.extraheader` entry in that one process's environment, scoped to `GITHUB_SERVER_URL`. Credentials a checkout already stored are respected and not duplicated.
+- **No expression injection.** No workflow or action puts `${{ }}` inside a `run:` script. Attacker-influenced values (branch names, inputs) go through environment variables or action inputs. The action's `args` are split on spaces with globbing off, and only ever become arguments of the stackq binary.
+- **The binary is verified.** The Action downloads the release binary and checks its SHA-256 against `checksums.txt` from the same release; on a mismatch it builds from the action's own checkout. This guards against corruption, not against a compromised release (see below).
+- **Least privilege in the examples:** CI has `contents: read`; the stackq workflows declare only what they use; the token is passed to the steps that need it, not set for the whole job; third-party actions are pinned to commit SHAs and kept current by Dependabot.
+- **Forks.** The workflows use `pull_request`, so fork PRs get a read-only token and no secrets. The `workflow_run` and `schedule` triggers do run with a write token, which is why `stackq.yml` checks out only the default branch and never executes code from a PR. Do not switch any of these to `pull_request_target`.
+
+### What GitHub, not stackq, has to enforce
+
+- **Write access is trust.** A user who can push a branch can change the workflow in their own branch and read the secrets `pull_request` hands to it. Limit who has write access.
+- **Rulesets.** Restrict who can create or push `stack/**` branches (stackq's own markers are only trusted there), and require review (CODEOWNERS) for `.github/workflows/**` and `.stackq.json`.
+- **Settings.** Require approval for workflow runs from outside collaborators; set the default workflow permission to read-only; leave "allow GitHub Actions to create and approve pull requests" off unless you rely on the built-in token to open stack PRs.
+- **`allowUnreviewed`** makes stackq land a stack with no human approval. Use it only in a repository where nobody untrusted can push to `stack/**`, such as a sandbox.
+- **Supply chain.** `uses: OWNER/stackq@v0` and `version: latest` run whatever the newest release is, with the workflow's token. Anyone who can publish a release of stackq can run code in every repository that follows it. In a repository that matters, pin an exact version (`version: v0.1.7`, or the commit SHA in `uses:`) and review updates.
+- **Token choice.** The built-in `GITHUB_TOKEN` lives for one job. A PAT or App token (`STACKQ_TOKEN`) outlives it, so give it only the repositories and permissions stackq needs.
 - **Signed commits.** If the repo requires signed commits, CI rebases produce unsigned commits and pushes are rejected (F13). Support is a roadmap item (§26).
-- **Stale-review dismissal.** If "dismiss stale approvals on push" is on, every restack push dismisses approvals. Enqueue then fails, and auto-merge waits for re-approval. That is safe, but the stack won't flow unattended. Document this for teams, or consider requiring approvals only on the first PR (§26).
+- **Stale-review dismissal.** If "dismiss stale approvals on push" is on, every restack push dismisses approvals. Enqueue then fails, and auto-merge waits for re-approval. That is safe, but the stack won't flow unattended.
 
 ---
 
