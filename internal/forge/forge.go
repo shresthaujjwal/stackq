@@ -86,11 +86,6 @@ type Forge interface {
 	Queue(branch string) ([]QueueEntry, error)
 	// ReadyAt is when label was last added to PR n (zero if unknown).
 	ReadyAt(n int, label string) (time.Time, error)
-	// CommitChecks rolls up the check runs and statuses on one commit
-	// (success, pending, failure or none).
-	CommitChecks(sha string) (string, error)
-	// StartCI runs a workflow file on ref through workflow_dispatch.
-	StartCI(workflow, ref string) error
 	Comment(n int, body string) error
 	ClosePR(n int) error
 	AddLabels(n int, labels ...string) error
@@ -426,19 +421,6 @@ func (g *GH) Enqueue(pr PR, o EnqueueOptions) error {
 		return nil
 	}
 	return fmt.Errorf("could not enqueue #%d: %v; auto-merge fallback also failed: %v", pr.Number, errQ, errA)
-}
-
-func (g *GH) CommitChecks(sha string) (string, error) {
-	states, err := g.commitChecks(sha)
-	if err != nil {
-		return "", err
-	}
-	return RollupChecks(states), nil
-}
-
-func (g *GH) StartCI(workflow, ref string) error {
-	_, err := g.run("", "workflow", "run", workflow, "--ref", ref)
-	return err
 }
 
 // API makes one REST GET through gh; path may use the {owner}/{repo}

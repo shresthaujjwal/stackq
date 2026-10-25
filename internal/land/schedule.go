@@ -26,7 +26,6 @@ func (c *Runner) submit(pr forge.PR, trunk string) (queued bool, err error) {
 		if err := c.Forge.Enqueue(pr, forge.EnqueueOptions{}); err != nil {
 			return false, err
 		}
-		c.startQueueCI(pr, trunk, c.queueWait())
 		return true, nil
 	}
 	if err := c.Forge.AddLabels(pr.Number, c.Prio.Label); err != nil {
@@ -125,7 +124,6 @@ func (c *Runner) Schedule(trunk string, dryRun bool) ([]prio.Decision, error) {
 			continue
 		}
 		c.Forge.RemoveLabels(pr.Number, cfg.Label, LabelBlocked)
-		c.startQueueCI(pr, trunk, c.queueWait())
 		labels := []string{"stackq:prio:" + d.Class.Name}
 		if jump {
 			labels = append(labels, forge.LabelJumped)
