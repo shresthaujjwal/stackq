@@ -7,6 +7,10 @@
 #
 # Create the label once (Issues > Labels > New label: stackq:split).
 #
+# To preview a split first, label the PR `stackq:plan` (create that label once
+# too). stackq comments the slices it would create, changes nothing else, and
+# removes the label; add it again after a push to refresh the comment.
+#
 # Token: add a STACKQ_TOKEN secret (fine-grained PAT or App token with contents
 # and pull-requests write) at the repo or org level. Without it the workflow
 # falls back to the built-in token, which needs
@@ -52,11 +56,69 @@ permissions:
 # split to the no-op run that the same label event also starts there (seen live).
 # Landing leaves a half-created stack alone (it waits until every part exists),
 # so a split does not need to wait for the stackq runs.
+# Plans get a group of their own, so a pending plan never replaces a pending
+# split, and runs for any other label (their jobs are skipped) get one each.
 concurrency:
-  group: stackq-split-${{ inputs.branch || github.event.pull_request.number }}
+  group: >-
+    ${{ github.event.label.name == 'stackq:plan' && format('stackq-plan-{0}', github.event.pull_request.number)
+    || (github.event_name == 'workflow_dispatch' || github.event.label.name == 'stackq:split') && format('stackq-split-{0}', inputs.branch || github.event.pull_request.number)
+    || format('stackq-split-skipped-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
+  plan:
+    if: >-
+      github.event.label.name == 'stackq:plan' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !startsWith(github.event.pull_request.head.ref, 'stack/')
+    runs-on: ubuntu-latest
+    env:
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0 # the planner needs the merge base and history
+          persist-credentials: false
+
+      # Plan makes no GitHub calls, so it gets no token, and it runs no build check.
+      - name: Plan
+        uses: YOUR_ORG/stackq@v0
+        with:
+          token: ${{ github.token }}
+          command: plan
+          args: --max-lines 400 --markdown ${{ runner.temp }}/plan.md
+          setup-go: "false"
+
+      # Update the earlier preview if there is one, so a PR has one plan comment.
+      - name: Comment the plan
+        env:
+          GH_TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          BODY: ${{ runner.temp }}/plan.md
+        run: |
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- stackq:plan -->")) | select(.user.type == "Bot" or .user.login == "github-actions[bot]") | .id' | tail -n1)
+          if [ -n "$id" ] && gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$BODY" > /dev/null; then
+            echo "Updated the plan comment"
+          else
+            gh pr comment "$PR" --body-file "$BODY"
+          fi
+
+      - name: Remove the label
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
+        run: gh pr edit "$PR" --remove-label stackq:plan || true
+
+      - name: Say so on the PR if it failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh pr comment "$PR" --body "stackq could not plan a split of this PR. See the run: $RUN_URL"
+
   split:
     if: >-
       github.event_name == 'workflow_dispatch' ||

@@ -35,9 +35,9 @@ inputs:
     default: latest
   setup-go:
     description: >
-      Whether to install Go: `auto` (the default) installs it for `split` and
-      `plan`, whose build check (`check` in .stackq.json) usually needs it, and
-      when stackq has to be built from source. `true` always installs it,
+      Whether to install Go: `auto` (the default) installs it for `split`,
+      whose build check (`check` in .stackq.json) usually needs it, and when
+      stackq has to be built from source. `true` always installs it,
       `false` only to build from source.
     required: false
     default: auto
@@ -88,7 +88,7 @@ runs:
     - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       if: >-
         steps.get.outputs.build == 'true' || inputs.setup-go == 'true' ||
-        (inputs.setup-go == 'auto' && (inputs.command == 'split' || inputs.command == 'plan'))
+        (inputs.setup-go == 'auto' && inputs.command == 'split')
       with:
         go-version: stable
         cache: false

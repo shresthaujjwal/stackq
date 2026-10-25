@@ -722,7 +722,7 @@ Inputs:
 - `command` (default `ci`): the stackq command to run. `ci` reads the GitHub event; `split`, `push`, `sync`, `status`, `land`, `revert` and `schedule` act on the branch the workflow checked out (use `fetch-depth: 0`). See `examples/stackq-split.yml`.
 - `args`: extra arguments for the command, passed through the environment variable `STACKQ_ARGS` to avoid expression injection. They are split on spaces and quotes are not interpreted, so put anything with spaces (such as `check`) in `.stackq.json`.
 
-- `setup-go` (default `auto`): whether to install Go. `auto` installs it for `split` and `plan`, whose build check usually needs a toolchain, and when stackq must be built from source; `true` always; `false` only for a source build.
+- `setup-go` (default `auto`): whether to install Go. `auto` installs it for `split`, whose build check usually needs a toolchain, and when stackq must be built from source; `true` always; `false` only for a source build.
 
 Steps:
 1. Get the binary. The `version` input (default `latest`) picks a release; when the workflow pins the action to a tag like `@v0.3.1` and the input is `latest`, that exact release is used. The step downloads `stackq_<os>_<arch>` and `checksums.txt` from the release and verifies the SHA-256. If the download or the checksum fails, or `version` is `source`, it prints a warning and asks for a source build.
@@ -771,6 +771,7 @@ Every push to `main` (a merged PR) is tested (`gofmt`, `go vet`, `go test -race`
 | Step | Started by |
 |---|---|
 | Split | `pull_request` labeled `stackq:split` |
+| Plan preview (a comment, nothing else changes) | `pull_request` labeled `stackq:plan` |
 | CI on stack branches | the `stackq` run after the split, through `workflow_dispatch` |
 | Auto-land once parts are green or approved | `workflow_run` (CI finished on a part), `pull_request_review` |
 | Pool admission | the same run that adds the pool label, and every later `tick` |
@@ -911,7 +912,7 @@ Stack resolution (`--stack` omitted): the stack containing the current branch, o
 
 | Command | Flags | Behavior |
 |---|---|---|
-| `plan` | same as split | Prints the plan and warnings. Writes nothing. |
+| `plan` | same as split, plus `--markdown FILE` | Prints the plan and warnings. Creates no branches. With `--markdown`, also writes the plan as a PR comment body to FILE: the `<!-- stackq:plan -->` marker, the plan in a code block and how to create the stack. The build check does not run, so a split can fold failing slices and end up with fewer PRs. |
 | `split` | `--from` (default: current branch), `--trunk`, `--name` (default: slug of the last path segment of `--from`), `--prefix`, `--max-lines`, `--check`, `--no-fold`, `--force`, `--from-pr N` (record the original PR), `--landing atomic\|incremental` (default: config, then atomic) | Plan, then Create. Refuses to run from trunk or a detached HEAD. Prints flag guard findings (§29.3). |
 | `push` | `--draft`, `--from-pr N`, `--no-source-pr`, `--close-source` | §12, §12.1 |
 | `sync` | `--no-fetch`, `--trunk` | §11 |
@@ -1140,7 +1141,7 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
 - **K13. Priority on live GitHub: the `mergeQueue` GraphQL shape and the pool pass are verified** (2026-10-25). Still unverified: `jump` permissions, and whether a pass triggered by Dependabot can read secrets (§31.7).
 - **K12. Revert relies on `refs/pull/N/head`** to find a PR's commits after its branch is deleted. GitHub keeps these refs, but forks and some mirrors don't.
 - **K6. `--force` deletion of prefix branches** fails if any of them is checked out; the error is the raw git error.
-- **K7. Concurrency groups drop pending runs (seen live, 2026-10-25).** GitHub keeps one running and **one pending** run per group; a newer pending run cancels the older one, even if the newer run's job is skipped by its `if`. With one shared group `stackq`, a label added while a stackq run was busy lost its split: the same label event also starts `stackq.yml`, whose no-op run took the pending slot and cancelled the split (which never ran, and left the `stackq:split` label on). Fixed in the examples: `stackq-split.yml` has its own group per source PR or branch, and `stackq.yml` gives runs that would do nothing a group of their own (`stackq-skipped-<run id>`). Real stackq runs still share `stackq`; a real run replaced by a newer real run is harmless because every run looks at all stacks, and a lost `dequeued` event is caught by the next tick (§28.4). Landing also refuses a stack that has fewer PRs than its marker's `total` (§28.2), so a split that is still opening its PRs is never landed half-way.
+- **K7. Concurrency groups drop pending runs (seen live, 2026-10-25).** GitHub keeps one running and **one pending** run per group; a newer pending run cancels the older one, even if the newer run's job is skipped by its `if`. With one shared group `stackq`, a label added while a stackq run was busy lost its split: the same label event also starts `stackq.yml`, whose no-op run took the pending slot and cancelled the split (which never ran, and left the `stackq:split` label on). Fixed in the examples: `stackq-split.yml` has its own group per source PR or branch (and a separate one for `stackq:plan` previews; runs for any other label get a group of their own), and `stackq.yml` gives runs that would do nothing a group of their own (`stackq-skipped-<run id>`). Real stackq runs still share `stackq`; a real run replaced by a newer real run is harmless because every run looks at all stacks, and a lost `dequeued` event is caught by the next tick (§28.4). Landing also refuses a stack that has fewer PRs than its marker's `total` (§28.2), so a split that is still opening its PRs is never landed half-way.
 - **K8. Commit hooks are skipped** at creation (`--no-verify`). This is intended, but document it.
 - **K9. `FullyApplied` treats a branch with zero unique commits as landed.** An intentionally empty slice would be marked landed. That's rare, since `--allow-empty` commits only happen if a slice has no file changes, which can't occur.
 - **K10. No support for multiple children** beyond what the marker allows. The code handles a list of children, but `split` only ever creates linear stacks.

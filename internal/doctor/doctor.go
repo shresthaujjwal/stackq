@@ -364,12 +364,22 @@ func checkLabels(api API) []Result {
 	if err := readJSON(b, &labels); err != nil {
 		return []Result{unknown("labels: "+short(err), "")}
 	}
+	have := map[string]bool{}
 	for _, l := range labels {
-		if l.Name == "stackq:split" {
-			return []Result{ok("label stackq:split exists")}
+		have[l.Name] = true
+	}
+	var rs []Result
+	for _, l := range []struct{ name, use string }{
+		{"stackq:split", "people apply it to split a PR"},
+		{"stackq:plan", "people apply it to preview a split"},
+	} {
+		if have[l.name] {
+			rs = append(rs, ok("label "+l.name+" exists"))
+		} else {
+			rs = append(rs, warn("label "+l.name+" does not exist", "create it once (Issues > Labels); "+l.use+". stackq creates its other labels itself"))
 		}
 	}
-	return []Result{warn("label stackq:split does not exist", "create it once (Issues > Labels) so people can apply it; stackq creates its other labels itself")}
+	return rs
 }
 
 func sortedKeys(m map[string]string) []string {
