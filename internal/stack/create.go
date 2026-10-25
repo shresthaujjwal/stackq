@@ -3,6 +3,7 @@ package stack
 import (
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -168,9 +169,31 @@ func chunks(s []string, n int) [][]string {
 	return out
 }
 
+// credentialVars hold tokens. The check command is whatever .stackq.json says,
+// read from the branch being split, so it must not inherit them.
+var credentialVars = map[string]bool{
+	"GH_TOKEN": true, "GITHUB_TOKEN": true, "STACKQ_TOKEN": true,
+	"GH_ENTERPRISE_TOKEN": true, "GITHUB_ENTERPRISE_TOKEN": true,
+	"ACTIONS_ID_TOKEN_REQUEST_TOKEN": true, "ACTIONS_ID_TOKEN_REQUEST_URL": true,
+	"ACTIONS_RUNTIME_TOKEN": true,
+}
+
+// envWithoutCredentials returns env minus the variables in credentialVars.
+func envWithoutCredentials(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if name, _, _ := strings.Cut(kv, "="); credentialVars[name] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 func runCheck(dir, check string) (string, error) {
 	cmd := exec.Command("sh", "-c", check)
 	cmd.Dir = dir
+	cmd.Env = envWithoutCredentials(os.Environ())
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

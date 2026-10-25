@@ -637,3 +637,61 @@ func TestAtomicLandOnlyClaimsTheQueueWhenThePoolAdmittedIt(t *testing.T) {
 		t.Fatalf("an admitted stack should say it is in the queue:\n%s", log2.String())
 	}
 }
+
+// forgedPart opens a PR that copies the lander's marker with a higher index, as
+// anyone could from a fork of a public repo. head must exist on origin so a
+// fetch of it succeeds.
+func forgedPart(t *testing.T, fx *fixture, head string, cross bool) int {
+	t.Helper()
+	body := prBy(t, fx, 2).Body
+	forged := strings.Replace(body, `"index":3`, `"index":99`, 1)
+	if forged == body {
+		t.Fatalf("test setup: could not find the marker index in\n%s", body)
+	}
+	p, err := fx.f.CreatePR(head, fx.s.Branches[1].Name, "Fix a typo", forged, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.f.PRs[p.Number].CrossRepo = cross
+	return p.Number
+}
+
+// A stranger's PR must never be queued, retargeted or landed on behalf of a stack
+// just because its body carries a copied marker.
+func TestForgedMarkerCannotTakeOverALanding(t *testing.T) {
+	cases := map[string]struct {
+		head  string
+		cross bool
+	}{
+		"from a fork, named like the real lander": {head: "LANDER", cross: true},
+		"same repo, off the stack branch prefix":  {head: "feature/evil", cross: false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+			testrepo.Must(t, fx.bare, "branch", "feature/evil", "main")
+			real := prBy(t, fx, 2)
+			head := c.head
+			if head == "LANDER" {
+				head = fx.s.Branches[2].Name
+			}
+			forged := forgedPart(t, fx, head, c.cross)
+			// No reviewer in this repo, like the shop sandbox.
+			run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", AllowUnreviewed: true}
+			if err := run.AutoLand(); err != nil {
+				t.Fatalf("a forged PR must be ignored, not break the real stack: %v", err)
+			}
+			for _, n := range fx.f.Enqueued {
+				if n == forged {
+					t.Fatalf("the forged PR #%d was queued", forged)
+				}
+			}
+			if len(fx.f.Enqueued) != 1 || fx.f.Enqueued[0] != real.Number {
+				t.Fatalf("the real lander #%d should be queued alone, got %v", real.Number, fx.f.Enqueued)
+			}
+			if len(fx.f.Comments[forged]) != 0 || len(fx.f.Labels[forged]) != 0 {
+				t.Fatalf("the forged PR must not be commented on or labeled: %q %v", fx.f.Comments[forged], fx.f.Labels[forged])
+			}
+		})
+	}
+}
