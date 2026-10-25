@@ -22,16 +22,29 @@ func (c *Runner) prioOn() bool { return c.Prio != nil && c.Prio.Enabled }
 
 // submit hands a PR to the merge queue: straight in when prioritization is
 // off, otherwise into the pool followed by a scheduling pass.
-func (c *Runner) submit(pr forge.PR, trunk string) error {
+func (c *Runner) submit(pr forge.PR, trunk string) (queued bool, err error) {
 	if !c.prioOn() {
-		return c.Forge.Enqueue(pr, forge.EnqueueOptions{})
+		if err := c.Forge.Enqueue(pr, forge.EnqueueOptions{}); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	if err := c.Forge.AddLabels(pr.Number, c.Prio.Label); err != nil {
-		return err
+		return false, err
 	}
 	c.logf("⧗ #%d is waiting in the priority pool", pr.Number)
-	_, err := c.Schedule(trunk, false)
-	return err
+	decisions, err := c.Schedule(trunk, false)
+	if err != nil {
+		return false, err
+	}
+	// The pool is found by a label search that can lag behind the label, so
+	// the pass may not have seen this PR yet. Only claim what happened.
+	for _, d := range decisions {
+		if d.PR.Number == pr.Number && (d.Action == prio.Admit || d.Action == prio.Jump) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Schedule runs one admission pass: rank the pool and top GitHub's queue up

@@ -151,11 +151,15 @@ func (c *Runner) Land(n int) error {
 	if isStack {
 		trunk = m.Trunk
 	}
-	if err := c.submit(pr, trunk); err != nil {
+	queued, err := c.submit(pr, trunk)
+	if err != nil {
 		return err
 	}
-	if !c.prioOn() {
+	switch {
+	case !c.prioOn():
 		c.logf("⇢ #%d is in the merge queue (or will join it when its checks pass)", n)
+	case !queued:
+		c.logf("⧗ #%d stays in the priority pool until a pass queues it (the next review, finished CI run or timer tick)", n)
 	}
 	return nil
 }
@@ -408,10 +412,15 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 		c.Forge.AddLabels(p.Number, LabelLanding)
 	}
 	c.Forge.RemoveLabels(lander.Number, LabelBlocked, LabelConflict)
-	if err := c.submit(lander, m.Trunk); err != nil {
+	queued, err := c.submit(lander, m.Trunk)
+	if err != nil {
 		return err
 	}
-	c.logf("⇢ #%d carries the whole stack (%d parts) into the queue", lander.Number, len(parts))
+	if queued {
+		c.logf("⇢ #%d carries the whole stack (%d parts) into the queue", lander.Number, len(parts))
+	} else {
+		c.logf("⧗ #%d carries the whole stack (%d parts) and stays in the priority pool until a pass queues it", lander.Number, len(parts))
+	}
 	return nil
 }
 
@@ -528,13 +537,18 @@ func (c *Runner) AfterMerge(n int) error {
 					"The rest of the stack was rebased onto `%s` but nothing was queued. Run `stackq land` to land the remainder together.",
 					n, m.Stack, trunk))
 			case c.Enqueue && !m.Atomic():
-				if err := c.submit(ch, trunk); err != nil {
+				queued, err := c.submit(ch, trunk)
+				if err != nil {
 					c.Forge.Comment(ch.Number, fmt.Sprintf("⚠️ stackq restacked this PR after #%d merged, but could not queue it:\n\n```\n%v\n```\n\nRun `stackq land --pr %d` once that is sorted out.", n, err, ch.Number))
 					c.Forge.AddLabels(ch.Number, LabelBlocked)
 					failed = append(failed, fmt.Sprintf("#%d (enqueue)", ch.Number))
 					continue
 				}
-				c.logf("⇢ #%d queued", ch.Number)
+				if queued {
+					c.logf("⇢ #%d queued", ch.Number)
+				} else {
+					c.logf("⧗ #%d is in the priority pool until a pass queues it", ch.Number)
+				}
 			}
 		}
 	} else {

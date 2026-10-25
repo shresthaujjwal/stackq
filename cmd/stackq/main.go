@@ -133,7 +133,7 @@ type config struct {
 }
 
 func (c *common) runner(r *git.Repo) *land.Runner {
-	return &land.Runner{Repo: r, Forge: &forge.GH{Dir: r.Dir}, Remote: c.remote, Log: os.Stdout,
+	return &land.Runner{Repo: r, Forge: &forge.GH{Dir: r.Dir, Log: os.Stdout}, Remote: c.remote, Log: os.Stdout,
 		MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority}
 }
 
@@ -446,7 +446,7 @@ func cmdPush(args []string) error {
 	if err != nil {
 		return err
 	}
-	return stack.Push(r, &forge.GH{Dir: r.Dir}, s, stack.PushOptions{
+	return stack.Push(r, &forge.GH{Dir: r.Dir, Log: os.Stdout}, s, stack.PushOptions{
 		Draft: *draft, SourcePR: *fromPR, NoSourcePR: *noSource,
 		CloseSource: *closeSource || c.cfg.CloseSource, Log: os.Stdout,
 	})

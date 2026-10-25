@@ -187,10 +187,15 @@ func (c *Runner) Revert(n int, o RevertOptions) (forge.PR, error) {
 	c.Forge.AddLabels(rpr.Number, LabelRevert)
 	if o.Enqueue {
 		rpr.HeadSHA = head
-		if err := c.submit(rpr, trunk); err != nil {
+		queued, err := c.submit(rpr, trunk)
+		if err != nil {
 			return rpr, fmt.Errorf("opened #%d but could not queue it: %w", rpr.Number, err)
 		}
-		c.logf("⇢ #%d submitted to the queue", rpr.Number)
+		if queued {
+			c.logf("⇢ #%d submitted to the queue", rpr.Number)
+		} else {
+			c.logf("⧗ #%d is in the priority pool until a pass queues it", rpr.Number)
+		}
 	}
 	return rpr, nil
 }
