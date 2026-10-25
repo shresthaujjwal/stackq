@@ -1,4 +1,4 @@
-# Every push to main (a merged PR) gets a version, a GitHub release, and
+# Every push to main (a merged PR) that changes more than Markdown gets a version, a GitHub release, and
 # binaries that other workflows can download instead of building stackq.
 #
 # Release notes list every merged PR since the last release (author, size,
@@ -16,6 +16,12 @@ name: release
 on:
   push:
     branches: [main]
+    # A merge that changes only Markdown (README, SPEC) needs no release; the
+    # next release includes it. Everything else releases: the binaries come from
+    # cmd/ and internal/, `uses: OWNER/stackq@v0` runs action.yml at the v0 tag,
+    # and the workflow sync check compares against examples/ at v0.
+    paths-ignore:
+      - "**.md"
 
 permissions:
   contents: write

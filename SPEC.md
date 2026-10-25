@@ -734,11 +734,12 @@ Releases are produced by `.github/workflows/release.yml` (§15.5).
 
 ### 15.5 Releases (`.github/workflows/release.yml`)
 
-Every push to `main` (a merged PR) is tested (`gofmt`, `go vet`, `go test -race`), versioned, built and released:
+Every push to `main` (a merged PR) that changes more than Markdown files is tested (`gofmt`, `go vet`, `go test -race`), versioned, built and released:
 - **Version:** the next patch after the latest `vX.Y.Z` tag (`v0.1.0` for the first release). `[minor]` or `[major]` anywhere in a commit message since the last tag, such as a PR title in the merge commit, bumps that part instead. A commit that already has a tag is skipped.
 - **Binaries:** `stackq_linux_amd64`, `stackq_linux_arm64`, `stackq_darwin_amd64`, `stackq_darwin_arm64`, `stackq_windows_amd64.exe` and `checksums.txt`, built with `CGO_ENABLED=0`, `-trimpath` and `-X main.version/main.commit`. The names carry no version, so `releases/latest/download/<name>` is a stable URL. The build fails unless `stackq version` reports the tag it is about to release.
 - **Release:** `gh release create` with generated notes, using `GITHUB_TOKEN` (`contents: write`).
 - **Major tag:** `v0` (or `v1`, ...) is moved to the new release, so `uses: OWNER/stackq@v0` follows the latest compatible release.
+- **Markdown-only merges** (README, SPEC) start no release (`paths-ignore: "**.md"`); the next release includes them, and a `[minor]` or `[major]` in their messages still counts then. Changes to `examples/` do release, because the workflow sync check reads them at the `v0` tag.
 - **Concurrency:** one release at a time. If several PRs merge while a release runs, only the newest waiting run starts, and it releases everything merged so far. Those earlier merges share its version.
 
 ### 15.2 Workflow (`examples/stackq.yml`)
