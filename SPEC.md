@@ -762,6 +762,19 @@ Every push to `main` (a merged PR) is tested (`gofmt`, `go vet`, `go test -race`
 | `pull_request_review`, `workflow_run`, `check_suite`, `schedule` | `autoLand` or the priority pool is on | `tick` (otherwise no-op) |
 
 `tick` does three things in order: `FinishLanded` (tidy stacks whose lander merged without the cleanup running, see below), `AutoLand` (if `autoLand` is on), then the priority pass (if the pool is on).
+
+**What wakes stackq.** Each step of a landing is started by an event; the cron is not relied on.
+
+| Step | Started by |
+|---|---|
+| Split | `pull_request` labeled `stackq:split` |
+| CI on stack branches | the `stackq` run after the split, through `workflow_dispatch` |
+| Auto-land once parts are green or approved | `workflow_run` (CI finished on a part), `pull_request_review` |
+| Pool admission | the same run that adds the pool label, and every later `tick` |
+| Cleanup after the queue merges | `workflow_run` for CI on the push to trunk (needs CI to run on `push` to trunk, as `examples/ci-merge-group.yml` does) |
+| Pausing a stack the queue rejected | `pull_request` dequeued |
+
+The 5-minute `schedule` is a safety net only: GitHub runs schedules late or skips them under load. In the sandbox repo it fired about every two hours (2026-10-24/25).
 | `workflow_dispatch` | `inputs.command` (default `land`; `schedule` and `tick` need no PR), `inputs.pr` (may start with `#`) | that command |
 | anything else | n/a | no-op |
 
@@ -1863,7 +1876,7 @@ If `enqueuePullRequest` fails, the PR leaves the pool, gets `stackq:blocked`, an
 
 ### 31.5 When a pass runs (`Schedule`)
 
-Each pass reads the pool (`gh pr list --label`), GitHub's queue (GraphQL `repository.mergeQueue(branch).entries`), and each PR's time in the pool (the latest `labeled` event, falling back to `createdAt`). It then ranks, decides and acts:
+Each pass reads the pool (the open PRs, filtered by the pool label in code; `gh pr list --label` goes through search, which lags a new label by seconds), GitHub's queue (GraphQL `repository.mergeQueue(branch).entries`), and each PR's time in the pool (the latest `labeled` event, falling back to `createdAt`). It then ranks, decides and acts:
 - **Jump or admit:** remove the pool label, add `stackq:prio:<class>` (plus `stackq:jumped` for a jump), and comment with the class, the reason and the wait.
 - **Report:** print the decision table, and append it to the Actions job summary.
 
@@ -1871,7 +1884,7 @@ Triggers (`examples/stackq.yml`):
 - `pull_request` labeled with the pool label,
 - `closed` (merged) and `dequeued`, which free a slot,
 - `pull_request_review` submitted, and `workflow_run` completed for your CI workflow, which can make a PR eligible,
-- a 5-minute cron as a safety net,
+- a 5-minute cron as a safety net (best effort: GitHub may run it hours late, so nothing depends on it),
 - `workflow_dispatch` with `schedule`.
 
 Every pass runs in the `stackq` concurrency group, so passes never race.
