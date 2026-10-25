@@ -1,8 +1,14 @@
-# Your CI needs three triggers for stackq. Replace the steps with your build
+# Your CI needs four triggers for stackq. Replace the steps with your build
 # and tests.
 name: ci
 
 on:
+  # Check what actually lands. A merge from the queue or with the built-in
+  # token starts no pull_request run, and a rebased head can differ from the
+  # commit that was tested. Change `main` if your default branch is named
+  # differently.
+  push:
+    branches: [main]
   # No branch filter: stack parts target stack/** branches, and atomic
   # landing needs their checks. (Or use branches: [main, 'stack/**'].)
   pull_request:
