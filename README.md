@@ -145,7 +145,7 @@ If the big branch already has an open PR, `stackq push` finds it (or pass `--fro
 ## GitHub setup
 
 1. **Merge queue.** Turn on the merge queue for `main` in the branch protection rules. Rebase, merge, and squash all work in CI. For local `stackq sync` landing detection, prefer rebase or merge (see Limits).
-2. **CI trigger.** Add `merge_group:` to your CI workflow's triggers. See `examples/ci-merge-group.yml`.
+2. **CI triggers.** Add `merge_group:` and `workflow_dispatch:` to your CI workflow's triggers, and `push:` on your default branch so what lands is checked too. See `examples/ci-merge-group.yml`.
 3. **stackq workflow.** Copy `examples/stackq.yml` to `.github/workflows/`, and point `uses:` at wherever you host this repo.
 4. **Token.** Give the workflow a GitHub App token or a fine-grained PAT with contents and pull-requests write access. Pushes made with the default `GITHUB_TOKEN` don't trigger other workflows, so a restacked PR would never get its checks.
 
@@ -155,7 +155,7 @@ To split from GitHub instead of a laptop, copy `examples/stackq-split.yml`. Labe
 
 **Landing by itself.** Set `"autoLand": true` in `.stackq.json` and an atomic stack lands as soon as the last part is approved and green. The workflow checks on every review, finished CI run and the 5-minute timer; a stack that isn't ready is left alone quietly, and one that is already landing is not queued twice.
 
-**Built-in token vs. an App or PAT.** The Action works with just `GITHUB_TOKEN`, with two limits that come from GitHub, not from stackq: events that token causes do not start workflows, and the merge queue does not run `merge_group` workflows for entries it added. stackq works around the first (the timer pass tidies a landed stack and a step starts CI on stack branches), but the second means the queue merges without CI on the merged result; each part's CI has already passed, so this is safe unless `main` moved in between. Give stackq a GitHub App token or a PAT as `STACKQ_TOKEN` to get queue CI and immediate cleanup.
+**Built-in token vs. an App or PAT.** The Action works with just `GITHUB_TOKEN`, with two limits that come from GitHub, not from stackq: events that token causes do not start workflows, and the merge queue does not run `merge_group` workflows for entries it added. stackq works around the first (the timer pass tidies a landed stack and a step starts CI on stack branches), but the second means the queue merges without CI on the merged result; each part's CI has already passed, so this is safe unless `main` moved in between. Give stackq a GitHub App token or a PAT as `STACKQ_TOKEN` to get queue CI and immediate cleanup. The example CI's `push` trigger runs on every commit that lands, so a problem the queue could not catch still shows up right after the merge.
 
 Manual controls, through workflow_dispatch or locally:
 
