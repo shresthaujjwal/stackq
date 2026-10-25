@@ -50,12 +50,14 @@ Local workflow:
   stackq schedule [--dry-run]                        rank the pool and top up the merge queue
   stackq status | list
   stackq doctor                                      check the repository is set up for stackq (read-only)
+  stackq gc [--delete]                               list (or delete) branches left behind by merged or finished stacks
 
 CI (GitHub Actions):
   stackq ci                                          act on the current event
   stackq ci after-merge|dequeued|land|revert --pr N  or run a step directly
   stackq ci schedule                                 one priority pass
   stackq ci doctor                                   the setup check, with the workflow's own token
+  stackq ci gc                                       delete branches left behind (gc --delete)
 
   stackq version                                     print the release this binary was built from
 
@@ -96,6 +98,8 @@ func main() {
 		err = cmdCI(args)
 	case "doctor":
 		err = cmdDoctor(args)
+	case "gc":
+		err = cmdGC(args)
 	case "version", "-v", "--version":
 		fmt.Println(versionString())
 		return
@@ -605,6 +609,10 @@ func cmdCI(args []string) error {
 	if sub == "doctor" {
 		return runDoctor(r, &c)
 	}
+	if sub == "gc" {
+		_, err := c.runner(r).GC(c.trunk(r, ""), true)
+		return err
+	}
 	if n == 0 && sub != "schedule" && sub != "tick" {
 		return fmt.Errorf("ci %s needs --pr", sub)
 	}
@@ -708,7 +716,7 @@ func fromEvent(poolLabel string, autoLand bool) (string, int, error) {
 		if cmd == "" || cmd == "<nil>" {
 			cmd = "land"
 		}
-		if cmd == "schedule" || cmd == "tick" || cmd == "doctor" {
+		if cmd == "schedule" || cmd == "tick" || cmd == "doctor" || cmd == "gc" {
 			return cmd, 0, nil
 		}
 		n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(fmt.Sprint(ev.Inputs["pr"])), "#"))
@@ -745,4 +753,24 @@ func runDoctor(r *git.Repo, c *common) error {
 		return errors.New("the setup has problems (✗ above)")
 	}
 	return nil
+}
+
+func cmdGC(args []string) error {
+	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
+	var c common
+	c.register(fs)
+	del := fs.Bool("delete", false, "delete the branches (default: only list them)")
+	trunkFlag := fs.String("trunk", "", "trunk branch (default: config, then the remote's HEAD)")
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	r, err := c.repo()
+	if err != nil {
+		return err
+	}
+	if c.remote == "" {
+		return fmt.Errorf("no git remote found")
+	}
+	_, err = c.runner(r).GC(c.trunk(r, *trunkFlag), *del)
+	return err
 }

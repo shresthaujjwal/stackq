@@ -69,6 +69,7 @@ func (p PR) Open() bool   { return p.State == "OPEN" }
 // Forge is everything stackq needs from the code host.
 type Forge interface {
 	// ListPRs returns open PRs, plus recently merged ones when state is "all".
+	// "closed" returns recently closed PRs, merged or not.
 	ListPRs(state string) ([]PR, error)
 	GetPR(n int) (PR, error)
 	Details(n int) (Details, error)
@@ -164,6 +165,9 @@ func (g *GH) list(state, limit string) ([]PR, error) {
 }
 
 func (g *GH) ListPRs(state string) ([]PR, error) {
+	if state == "closed" {
+		return g.list("closed", "200") // closed and merged, newest first
+	}
 	prs, err := g.list("open", "500")
 	if err != nil || state != "all" {
 		return prs, err
