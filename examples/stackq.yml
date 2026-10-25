@@ -36,6 +36,11 @@ permissions:
   contents: write
   pull-requests: write
   actions: write # to start CI on stack branches
+  # To read CI results. A permission that is not listed is set to none, and
+  # without these two every PR looks as if it had no checks at all: the gate for
+  # failing or pending checks sees nothing, and auto-land waits forever.
+  checks: read
+  statuses: read
 
 # One stack step at a time, never cancelled halfway through a push.
 concurrency:

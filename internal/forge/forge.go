@@ -202,11 +202,56 @@ type ghDetails struct {
 	MergeCommit *struct {
 		Oid string `json:"oid"`
 	} `json:"mergeCommit"`
-	Commits []json.RawMessage `json:"commits"`
+	Commits    []json.RawMessage `json:"commits"`
+	HeadRefOid string            `json:"headRefOid"`
+}
+
+// commitChecks lists the check runs and commit statuses on a commit. The PR's
+// statusCheckRollup leaves out runs started by workflow_dispatch (which is how
+// a stack branch gets its CI when the built-in token pushed it), so the commit
+// is asked directly.
+func (g *GH) commitChecks(sha string) ([]string, error) {
+	var states []string
+	out, err := g.run("", "api", "repos/{owner}/{repo}/commits/"+sha+"/check-runs?per_page=100")
+	if err != nil {
+		return nil, err
+	}
+	var runs struct {
+		CheckRuns []struct {
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	if err := json.Unmarshal(out, &runs); err != nil {
+		return nil, err
+	}
+	for _, r := range runs.CheckRuns {
+		if r.Status != "completed" {
+			states = append(states, "PENDING")
+		} else {
+			states = append(states, r.Conclusion)
+		}
+	}
+	out, err = g.run("", "api", "repos/{owner}/{repo}/commits/"+sha+"/status")
+	if err != nil {
+		return nil, err
+	}
+	var st struct {
+		Statuses []struct {
+			State string `json:"state"`
+		} `json:"statuses"`
+	}
+	if err := json.Unmarshal(out, &st); err != nil {
+		return nil, err
+	}
+	for _, s := range st.Statuses {
+		states = append(states, s.State)
+	}
+	return states, nil
 }
 
 func (g *GH) Details(n int) (Details, error) {
-	out, err := g.run("", "pr", "view", strconv.Itoa(n), "--json", "latestReviews,statusCheckRollup,mergeCommit,commits")
+	out, err := g.run("", "pr", "view", strconv.Itoa(n), "--json", "latestReviews,statusCheckRollup,mergeCommit,commits,headRefOid")
 	if err != nil {
 		return Details{}, err
 	}
@@ -233,6 +278,13 @@ func (g *GH) Details(n int) (Details, error) {
 		default:
 			states = append(states, c.Conclusion)
 		}
+	}
+	if raw.HeadRefOid != "" {
+		more, err := g.commitChecks(raw.HeadRefOid)
+		if err != nil {
+			return Details{}, err
+		}
+		states = append(states, more...)
 	}
 	d.Checks = RollupChecks(states)
 	if raw.MergeCommit != nil {
