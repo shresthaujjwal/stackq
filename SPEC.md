@@ -775,6 +775,8 @@ Every push to `main` (a merged PR) is tested (`gofmt`, `go vet`, `go test -race`
 | Pausing a stack the queue rejected | `pull_request` dequeued, and every `tick` as a fallback (§28.4) |
 
 The 5-minute `schedule` is a safety net only: GitHub runs schedules late or skips them under load. In the sandbox repo it fired about every two hours (2026-10-24/25).
+
+**A lost `workflow_run` event (seen live).** In one run all seven CI runs of a fresh stack finished and GitHub never started a `stackq` run for them; the stack waited 11 minutes until a manual `tick`, because the cron is no help. Earlier stacks got their run within a minute, so this is GitHub dropping or delaying an event, not a stackq rule. The step that starts CI therefore waits for the runs it started (`gh run watch`) and then dispatches one `tick` itself. It cannot loop: it only dispatches after starting CI, and a tick finds every branch already has a run. The result is that a lost event costs nothing, at the price of a job that stays up for the length of the CI run (the step has a 15-minute timeout).
 | `workflow_dispatch` | `inputs.command` (default `land`; `schedule` and `tick` need no PR), `inputs.pr` (may start with `#`) | that command |
 | anything else | n/a | no-op |
 

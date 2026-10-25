@@ -100,18 +100,34 @@ jobs:
       # actually ran (a run waiting for approval does not count).
       # Harmless when a PAT or an App token is used.
       - name: Start CI on the stack branches
+        timeout-minutes: 15
         env:
           GH_TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
         run: |
-          gh pr list --state open --json headRefName,headRefOid \
-            --jq '.[] | select(.headRefName | startswith("stack/")) | "\(.headRefName) \(.headRefOid)"' |
+          started=""
           while read -r branch sha; do
             # A run waiting for approval (action_required) has not run any checks.
             seen=$(gh run list --workflow ci.yml --branch "$branch" --json headSha,conclusion --jq ".[] | select(.headSha == \"$sha\" and .conclusion != \"action_required\") | .headSha" | head -n1)
             if [ -z "$seen" ]; then
-              gh workflow run ci.yml --ref "$branch" || true
+              out=$(gh workflow run ci.yml --ref "$branch" 2>&1) || { echo "$out"; continue; }
+              echo "$out"
+              started="$started $(printf '%s' "$out" | grep -o '/runs/[0-9]*' | tail -1 | cut -d/ -f3)"
             fi
-          done
+          done < <(gh pr list --state open --json headRefName,headRefOid \
+            --jq '.[] | select(.headRefName | startswith("stack/")) | "\(.headRefName) \(.headRefOid)"')
+
+          # A finished CI run normally starts the next stackq run (workflow_run),
+          # which is what lands the stack. GitHub can lose that event: once none
+          # came for 11 minutes, and the schedule is no safety net (it fired about
+          # every two hours). So wait for the runs started above and start one tick
+          # ourselves. It cannot loop: a tick only gets here to dispatch CI when a
+          # branch has none, and by then every branch has a run. (Rename stackq.yml
+          # below if you renamed this workflow.)
+          if [ -n "${started// /}" ]; then
+            for id in $started; do gh run watch "$id" > /dev/null 2>&1 || true; done
+            gh workflow run stackq.yml --ref "$DEFAULT_BRANCH" -f command=tick -f pr=0 || true
+          fi
 
       # Take the label off so applying it again retries.
       - name: Remove the label
