@@ -381,6 +381,15 @@ func statusLanding(parts int) string {
 	return fmt.Sprintf("🚀 **Landing.** This PR carries all %d parts into the merge queue as one entry.", parts)
 }
 
+// statusAutoMerge is for a lander GitHub would not queue yet: auto-merge is on
+// and waits for what GitHub requires of the PR itself. With the built-in token
+// that is usually a required check that only the PR's own pull_request run can
+// satisfy, and that run is held for approval.
+func statusAutoMerge(parts int) string {
+	return fmt.Sprintf("⏳ **Waiting for GitHub's requirements.** This PR carries all %d parts. GitHub would not put it in the merge queue yet, so auto-merge is on and queues it once the PR itself meets them: required checks passed, reviews given. "+
+		"If CI shows \"awaiting approval\" on this PR, approve that run. A required check is only met by CI that a pull request or the queue started, not by the CI stackq starts with the built-in token (see the README).", parts)
+}
+
 func statusPool(parts int) string {
 	return fmt.Sprintf("⧗ **Waiting in the priority pool** for a merge-queue slot. This PR carries all %d parts.", parts)
 }
@@ -430,8 +439,10 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 			}
 		case statePool:
 			c.setStatus(lander, statusPool(len(parts)))
-		case stateQueued, stateAutoMerge:
+		case stateQueued:
 			c.setStatus(lander, statusLanding(len(parts)))
+		case stateAutoMerge:
+			c.setStatus(lander, statusAutoMerge(len(parts)))
 		}
 		c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
 		return nil

@@ -209,20 +209,21 @@ func checkRules(api API, cfg Config) []Result {
 		checks, err = protectionChecks(api, cfg.Trunk)
 		if err != nil {
 			return append(rs, unknown("required status checks on "+cfg.Trunk+": none in the rulesets, and branch protection could not be read ("+short(err)+")",
-				"make sure your CI check is required on "+cfg.Trunk))
+				"if your CI check is required there, read the next point"))
 		}
 	}
 	if len(checks) == 0 {
-		rs = append(rs, fail("no required status checks on "+cfg.Trunk,
-			"require your CI check in the ruleset; otherwise the queue merges without testing the result against the latest "+cfg.Trunk))
+		rs = append(rs, ok("no required status checks on "+cfg.Trunk+": the queue merges a stack as soon as the parts' PR checks allow"))
+		rs = append(rs, warn("what lands is not tested against the latest "+cfg.Trunk+" before the merge",
+			"CI on the push to "+cfg.Trunk+" shows a problem right after. To test it first, require your CI check and give stackq a GitHub App token as STACKQ_TOKEN (see the README)"))
 	} else {
 		sort.Strings(checks)
-		rs = append(rs, ok("required checks on "+cfg.Trunk+": "+strings.Join(checks, ", ")))
+		rs = append(rs, warn("required checks on "+cfg.Trunk+": "+strings.Join(checks, ", ")+" (fine if STACKQ_TOKEN is a GitHub App or PAT token)",
+			"with the built-in token the CI stackq starts (workflow_dispatch) does not count: a stack's lander cannot join the queue until someone approves its own pull_request CI run, and the queue then waits for a check it never accepts. Use an App token as STACKQ_TOKEN, or do not require the check"))
 	}
 	return rs
 }
 
-// protectionChecks lists the checks classic branch protection requires.
 func protectionChecks(api API, branch string) ([]string, error) {
 	b, err := api.API("repos/{owner}/{repo}/branches/" + branch)
 	if err != nil {

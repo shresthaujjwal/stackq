@@ -788,7 +788,14 @@ GitHub does not start workflows for events caused by the built-in `GITHUB_TOKEN`
 
 `Runner.FinishLanded` closes that gap. For every open atomic stack whose lander is merged it checks for leftovers: a part that is still open, or the held PR still targeting a stack branch. If there are any it runs `AfterMerge(lander)`, which is idempotent. A held PR that could not be rebased (labeled `stackq:conflict`) is skipped, so a conflict is reported once, not every tick. A tidy stack is left alone.
 
-**With the built-in token, also note:** the merge queue does not run `merge_group` workflows for entries that token added, so the queue merges without CI on the merged result. A GitHub App or PAT (`STACKQ_TOKEN`) avoids both this and the missing cleanup trigger.
+**With the built-in token, also note:** the merge queue does not run `merge_group` workflows for entries that token added (the sandbox repo has none), so the queue merges without CI on the merged result. A GitHub App or PAT (`STACKQ_TOKEN`) avoids both this and the missing cleanup trigger.
+
+**Required checks (tested live 2026-10-25).** With `test` required on trunk and the built-in token, a stack cannot land:
+
+1. The lander's head had a passing `test` from the CI stackq starts with `workflow_dispatch`, yet GitHub refused `enqueuePullRequest` with `Required status check "test" is expected`, and stackq fell back to auto-merge. The PR became mergeable only after a person approved the PR's own `pull_request` CI run, which GitHub holds as `action_required` for PRs the built-in token opens.
+2. Once enqueued, the queue created `gh-readonly-queue/<trunk>/pr-<n>-…`. A dispatched CI run on that commit passed and reported `test` from the same app (GitHub Actions, id 15368), yet the entry stayed `AWAITING_CHECKS` for 20+ minutes. It merged within seconds of the requirement being removed.
+
+The check name and source were identical in every case; only the triggering event differed. A required check is met only by runs started by a pull request or the merge queue, so a `workflow_dispatch` run on the right commit does not count. Nothing the built-in token can start has that event. Starting CI on the queue's branch (tried as `queueCI`, removed again) therefore does not help, and posting the result as a status or check run would be the workflow vouching for itself, so it is not done. Use a GitHub App or PAT as `STACKQ_TOKEN` for required checks, or leave them off. `stackq doctor` reports both setups, and the lander's description says when it is waiting for GitHub's requirements.
 
 ### 15.4 Required repository settings
 
@@ -907,7 +914,7 @@ Stack resolution (`--stack` omitted): the stack containing the current branch, o
 | `revert` | `--pr N` (required), `--only`, `--enqueue`, `--force` | §28.5 |
 | `schedule` | `--dry-run`, `--trunk` | One priority pass (§31.5) |
 | `gc` | `--delete`, `--trunk` | List (default) or delete remote branches left behind: the head of a merged PR, a stack or revert branch whose PR was closed, the source of a finished stack. Only when no open PR uses the branch and its tip still equals its last PR's head; deleted with a lease on that tip. Also `ci gc` and the dispatch command `gc`, which delete. |
-| `doctor` | `-C` | Read-only setup check: config, merge queue and required checks on trunk, repository and Actions settings, workflow files, labels. ✓ / ! / ✗ / ?, exit 1 on any ✗. Also `ci doctor` and the dispatch command `doctor`. A setting the token cannot read is reported as ?, never as passing. |
+| `doctor` | `-C` | Read-only setup check: config, merge queue on trunk and what required checks mean for the token in use, repository and Actions settings, workflow files, labels. ✓ / ! / ✗ / ?, exit 1 on any ✗. Also `ci doctor` and the dispatch command `doctor`. A setting the token cannot read is reported as ?, never as passing. |
 | `queue` | `--pr N` | Add any PR to the priority pool, then run a pass |
 | `status` | | Per branch: index, ✅/⬜, PR#, commits on its parent, "needs sync" if the parent tip is not an ancestor, "unpushed" if local differs from `PushedSHA`. |
 | `list` | | All stacks, with landed/total counts and the source. |

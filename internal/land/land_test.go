@@ -600,8 +600,16 @@ func TestLanderBodyShowsTheLandingStatus(t *testing.T) {
 		t.Fatalf("status not updated when the stack was queued:\n%s", b)
 	}
 
-	fx.f.MQ = nil // dropped without a dequeued run
+	// GitHub refused the direct enqueue and turned on auto-merge instead.
+	fx.f.MQ = nil
+	fx.f.SetDetails(lander.Number, func(d *forge.Details) { d.AutoMerge = true })
 	tick()
+	if b := body(); !strings.Contains(b, "Waiting for GitHub's requirements") || !strings.Contains(b, "awaiting approval") || strings.Contains(b, "Landing.") {
+		t.Fatalf("auto-merge wait not explained on the lander:\n%s", b)
+	}
+	fx.f.SetDetails(lander.Number, func(d *forge.Details) { d.AutoMerge = false })
+
+	tick() // dropped without a dequeued run
 	if b := body(); !strings.Contains(b, "Paused.") {
 		t.Fatalf("pause not shown:\n%s", b)
 	}

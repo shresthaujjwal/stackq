@@ -28,9 +28,10 @@ func (f fakeAPI) Queue(string) ([]forge.QueueEntry, error) { return nil, f.queue
 func healthy() fakeAPI {
 	return fakeAPI{paths: map[string]string{
 		"repos/{owner}/{repo}":                              `{"default_branch":"main","allow_auto_merge":true,"allow_rebase_merge":true,"delete_branch_on_merge":true}`,
-		"repos/{owner}/{repo}/rules/branches/main":          `[{"type":"merge_queue","parameters":{"merge_method":"REBASE"}},{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"test"}]}}]`,
+		"repos/{owner}/{repo}/rules/branches/main":          `[{"type":"merge_queue","parameters":{"merge_method":"REBASE"}}]`,
 		"repos/{owner}/{repo}/actions/permissions/workflow": `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":true}`,
 		"repos/{owner}/{repo}/labels?per_page=100":          `[{"name":"bug"},{"name":"stackq:split"}]`,
+		"repos/{owner}/{repo}/branches/main":                `{"protection":{"required_status_checks":{"contexts":[]}}}`,
 	}}
 }
 
@@ -88,10 +89,15 @@ func levels(rs []Result, l Level) []string {
 
 func TestAHealthyRepoPasses(t *testing.T) {
 	rs := Run(healthy(), repoWith(t, healthyFiles()), cfg)
-	for _, l := range []Level{Warn, Fail, Unknown} {
+	for _, l := range []Level{Fail, Unknown} {
 		if got := levels(rs, l); len(got) > 0 {
 			t.Fatalf("level %d findings on a healthy repo: %q", l, got)
 		}
+	}
+	// The one trade-off of the built-in token is said out loud, not hidden.
+	w := levels(rs, Warn)
+	if len(w) != 1 || !strings.Contains(w[0], "not tested against the latest main") {
+		t.Fatalf("a repo without required checks should carry exactly the untested-merge note, got %q", w)
 	}
 	var out bytes.Buffer
 	if Print(&out, rs) {
@@ -103,15 +109,13 @@ func TestAHealthyRepoPasses(t *testing.T) {
 func TestReportsTheGapsFromTheLiveRuns(t *testing.T) {
 	api := healthy()
 	api.queueErr = errors.New("branch main has no merge queue")
-	api.paths["repos/{owner}/{repo}/rules/branches/main"] = `[]`
-	api.paths["repos/{owner}/{repo}/branches/main"] = `{"protection":{"required_status_checks":{"contexts":[]}}}`
 	files := healthyFiles()
 	files["stackq.yml"] = strings.Replace(stackqYML, "  checks: read\n  statuses: read\n", "", 1)
 	files["ci.yml"] = "name: ci\non:\n  pull_request:\n"
 
 	rs := Run(api, repoWith(t, files), cfg)
 	fails := strings.Join(levels(rs, Fail), "\n")
-	for _, want := range []string{"no merge queue on main", "no required status checks on main", "stackq.yml cannot read CI results", "has no merge_group trigger"} {
+	for _, want := range []string{"no merge queue on main", "stackq.yml cannot read CI results", "has no merge_group trigger"} {
 		if !strings.Contains(fails, want) {
 			t.Errorf("missing problem %q in:\n%s", want, fails)
 		}
@@ -128,13 +132,26 @@ func TestReportsTheGapsFromTheLiveRuns(t *testing.T) {
 	}
 }
 
-func TestClassicProtectionChecksCount(t *testing.T) {
-	api := healthy()
-	api.paths["repos/{owner}/{repo}/rules/branches/main"] = `[]`
-	api.paths["repos/{owner}/{repo}/branches/main"] = `{"protection":{"required_status_checks":{"contexts":["test"]}}}`
-	rs := Run(api, repoWith(t, healthyFiles()), cfg)
-	if got := levels(rs, Fail); len(got) > 0 {
-		t.Fatalf("checks required by branch protection must count: %q", got)
+// A required check is the setup that does not work with stackq's own CI runs
+// under the built-in token: say so, whether it comes from a ruleset or from
+// classic branch protection.
+func TestRequiredChecksWarnAboutTheBuiltInToken(t *testing.T) {
+	ruleset := healthy()
+	ruleset.paths["repos/{owner}/{repo}/rules/branches/main"] = `[{"type":"merge_queue","parameters":{"merge_method":"REBASE"}},{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"test"}]}}]`
+	classic := healthy()
+	classic.paths["repos/{owner}/{repo}/branches/main"] = `{"protection":{"required_status_checks":{"contexts":["test"]}}}`
+	for name, api := range map[string]fakeAPI{"ruleset": ruleset, "branch protection": classic} {
+		rs := Run(api, repoWith(t, healthyFiles()), cfg)
+		if got := levels(rs, Fail); len(got) > 0 {
+			t.Fatalf("%s: a required check is not a failure: %q", name, got)
+		}
+		w := strings.Join(levels(rs, Warn), "\n")
+		if !strings.Contains(w, "required checks on main: test") || !strings.Contains(w, "STACKQ_TOKEN is a GitHub App or PAT token") {
+			t.Fatalf("%s: required check not reported with the token caveat: %q", name, w)
+		}
+		if strings.Contains(w, "not tested against the latest main") {
+			t.Fatalf("%s: reported as untested although a check is required: %q", name, w)
+		}
 	}
 }
 
