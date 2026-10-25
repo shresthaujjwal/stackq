@@ -419,6 +419,10 @@ func (g *GH) Enqueue(pr PR, o EnqueueOptions) error {
 	return fmt.Errorf("could not enqueue #%d: %v; auto-merge fallback also failed: %v", pr.Number, errQ, errA)
 }
 
+// API makes one REST GET through gh; path may use the {owner}/{repo}
+// placeholders. Not part of Forge: only stackq doctor reads settings this way.
+func (g *GH) API(path string) ([]byte, error) { return g.run("", "api", path) }
+
 func (g *GH) ClosePR(n int) error {
 	_, err := g.run("", "pr", "close", strconv.Itoa(n))
 	return err
