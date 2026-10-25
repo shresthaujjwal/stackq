@@ -1,0 +1,9 @@
+# Changes to these paths need the owner's review once "Require review from Code
+# Owners" is switched on in the branch rules. Until then this file does nothing.
+# The workflows, the action and the release pipeline run with write tokens, and
+# the examples are copied into other repositories.
+/.github/        @shresthaujjwal
+/action.yml      @shresthaujjwal
+/examples/       @shresthaujjwal
+/cmd/            @shresthaujjwal
+/internal/       @shresthaujjwal
