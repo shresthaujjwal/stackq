@@ -48,8 +48,23 @@ permissions:
   statuses: read
 
 # One stack step at a time, never cancelled halfway through a push.
+#
+# GitHub keeps one running and one pending run per group, and a newer pending
+# run replaces the older one, even if its job is skipped by the `if` below. This
+# workflow starts on every label and every PR close, most of which do nothing, so
+# those runs get a group of their own: they must not take the pending slot of a
+# run that has work to do. (A real run replaced by a newer real run is fine: every
+# run looks at all stacks. `dequeued` is also caught on the next tick.)
 concurrency:
-  group: stackq
+  group: >-
+    ${{ (github.event_name == 'workflow_dispatch' ||
+         github.event_name == 'schedule' ||
+         github.event_name == 'pull_request_review' ||
+         github.event_name == 'workflow_run' ||
+         (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'stackq:queue') ||
+         (github.event_name == 'pull_request' && github.event.action != 'labeled' &&
+          (github.event.action == 'dequeued' || github.event.pull_request.merged == true)))
+        && 'stackq' || format('stackq-skipped-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:

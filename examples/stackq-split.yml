@@ -46,9 +46,14 @@ permissions:
   pull-requests: write
   actions: write
 
-# Share stackq's group so a split never overlaps a restack.
+# Its own group per source PR or branch. GitHub keeps one running and ONE
+# PENDING run per group, and a newer pending run cancels the older one. In the
+# shared "stackq" group a label added while a stackq run was busy lost its
+# split to the no-op run that the same label event also starts there (seen live).
+# Landing leaves a half-created stack alone (it waits until every part exists),
+# so a split does not need to wait for the stackq runs.
 concurrency:
-  group: stackq
+  group: stackq-split-${{ inputs.branch || github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
