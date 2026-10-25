@@ -506,6 +506,67 @@ func TestAutoLandWaitsQuietlyThenLandsOnce(t *testing.T) {
 	}
 }
 
+// The queue can drop the lander without the dequeued run ever handling it
+// (a newer run in the concurrency group replaces a pending one). The next tick
+// must notice and pause the stack once, instead of calling it landing forever.
+func TestAutoLandPausesALanderThatSilentlyLeftTheQueue(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
+	}
+	lander := prBy(t, fx, 2)
+	if lander.BaseRef != "main" || len(fx.f.MQ) != 1 {
+		t.Fatalf("stack not queued: base=%s queue=%v", lander.BaseRef, fx.f.MQ)
+	}
+	comments := len(fx.f.Comments[lander.Number])
+	tick := func(why string) {
+		t.Helper()
+		if err := run.AutoLand(); err != nil {
+			t.Fatalf("%s: %v", why, err)
+		}
+	}
+	unchanged := func(why string) {
+		t.Helper()
+		if fx.f.Labels[lander.Number][land.LabelBlocked] || len(fx.f.Comments[lander.Number]) != comments {
+			t.Fatalf("%s: a landing stack was paused: %q", why, fx.f.Comments[lander.Number])
+		}
+	}
+
+	tick("still in the queue")
+	unchanged("still in the queue")
+
+	fx.f.MQ = nil
+	fx.f.SetDetails(lander.Number, func(d *forge.Details) { d.AutoMerge = true })
+	tick("waiting for auto-merge")
+	unchanged("waiting for auto-merge")
+
+	fx.f.QueueErr = errors.New("cannot read the queue")
+	fx.f.SetDetails(lander.Number, func(d *forge.Details) { d.AutoMerge = false })
+	tick("queue unreadable")
+	unchanged("queue unreadable")
+	fx.f.QueueErr = nil
+
+	tick("dropped from the queue")
+	cs := fx.f.Comments[lander.Number]
+	if !fx.f.Labels[lander.Number][land.LabelBlocked] || len(cs) != comments+1 || !strings.Contains(cs[len(cs)-1], "left the merge queue") {
+		t.Fatalf("dropped lander not paused: labels=%v comments=%q", fx.f.Labels[lander.Number], cs)
+	}
+
+	tick("already paused")
+	if len(fx.f.Comments[lander.Number]) != comments+1 || len(fx.f.Enqueued) != 1 {
+		t.Fatalf("paused stack touched again: comments=%d queued=%v", len(fx.f.Comments[lander.Number]), fx.f.Enqueued)
+	}
+
+	// After a fix, landing by hand queues it again and clears the pause.
+	if err := run.Land(lander.Number); err != nil {
+		t.Fatal(err)
+	}
+	if fx.f.Labels[lander.Number][land.LabelBlocked] || len(fx.f.Enqueued) != 2 {
+		t.Fatalf("manual land did not resume: labels=%v queued=%v", fx.f.Labels[lander.Number], fx.f.Enqueued)
+	}
+}
+
 func TestAutoLandIgnoresIncrementalStacksAndForeignPRs(t *testing.T) {
 	fx := setup(t) // incremental stack
 	fx.f.CreatePR("someone/else", "main", "unrelated", "no marker here", false)

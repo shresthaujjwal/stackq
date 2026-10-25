@@ -305,6 +305,49 @@ func (c *Runner) queued(n int, trunk string) bool {
 	return false
 }
 
+// labeled reports whether open PR n carries label.
+func (c *Runner) labeled(n int, label string) bool {
+	prs, err := c.Forge.ListPool(label)
+	if err != nil {
+		return false
+	}
+	for _, p := range prs {
+		if p.Number == n {
+			return true
+		}
+	}
+	return false
+}
+
+// leftQueue reports whether a lander that targets trunk is no longer on its
+// way in: not in the merge queue, not waiting in the priority pool, no
+// auto-merge pending, and not merged. GitHub sends a dequeued event when the
+// queue drops a PR, but the run for it can be lost: the workflows share one
+// concurrency group, and a newer pending run replaces an older one. Without
+// this check such a stack would be reported as landing forever. Any doubt
+// (the queue cannot be read, a lookup fails) counts as still landing.
+func (c *Runner) leftQueue(lander forge.PR, trunk string) bool {
+	if c.prioOn() && c.labeled(lander.Number, c.Prio.Label) {
+		return false
+	}
+	q, err := c.Forge.Queue(trunk)
+	if err != nil {
+		return false
+	}
+	for _, e := range q {
+		if e.PR == lander.Number {
+			return false
+		}
+	}
+	d, err := c.Forge.Details(lander.Number)
+	if err != nil || d.AutoMerge || d.MergeCommit != "" {
+		return false
+	}
+	// Last, so a merge that happened while we looked is seen.
+	pr, err := c.Forge.GetPR(lander.Number)
+	return err == nil && pr.Open()
+}
+
 // attemptAtomic gates and queues an atomic stack. With auto set it is quiet:
 // anything that stops the landing is logged and returns nil, because the next
 // event will try again.
@@ -338,7 +381,15 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 	lander := parts[len(parts)-1]
 	// Once the lander targets trunk the stack is landing; don't queue it twice.
 	if auto && lander.BaseRef == m.Trunk && (len(parts) > 1 || c.queued(lander.Number, m.Trunk)) {
-		c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
+		switch {
+		case c.labeled(lander.Number, LabelBlocked):
+			c.logf("- stack %s is paused: #%d is labeled %s; fix it, then run stackq land --pr %d", m.Stack, lander.Number, LabelBlocked, lander.Number)
+		case len(parts) > 1 && c.leftQueue(lander, m.Trunk):
+			c.logf("! #%d left the merge queue without merging, and no dequeued run handled it", lander.Number)
+			return c.Dequeued(lander.Number)
+		default:
+			c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
+		}
 		return nil
 	}
 
@@ -671,7 +722,7 @@ func (c *Runner) finishAtomic(sp *stackPRs, lander forge.PR, m stack.Marker, chi
 		sp.set(p)
 		c.logf("✕ closed #%d (landed inside #%d)", p.Number, lander.Number)
 	}
-	c.Forge.RemoveLabels(lander.Number, LabelLanding)
+	c.Forge.RemoveLabels(lander.Number, LabelLanding, LabelBlocked)
 
 	if !c.KeepBranches {
 		// The lander's branch is the base of held PRs until they are
