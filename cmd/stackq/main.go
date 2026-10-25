@@ -625,10 +625,11 @@ func cmdCI(args []string) error {
 		_, err := run.Schedule(trunk, false)
 		return err
 	case "tick":
-		// Land stacks that became ready, then refill the queue by priority.
-		var err error
+		// Tidy stacks that merged without their cleanup running, land stacks
+		// that became ready, then refill the queue by priority.
+		err := run.FinishLanded()
 		if c.cfg.AutoLand {
-			err = run.AutoLand()
+			err = errors.Join(err, run.AutoLand())
 		}
 		if run.Prio != nil && run.Prio.Enabled {
 			if _, serr := run.Schedule(trunk, false); serr != nil {
