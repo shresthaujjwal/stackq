@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"stackq/internal/doctor"
 	"stackq/internal/forge"
 	"stackq/internal/git"
 	"stackq/internal/land"
@@ -48,11 +49,13 @@ Local workflow:
   stackq queue --pr N                                add any PR to the priority pool, then schedule
   stackq schedule [--dry-run]                        rank the pool and top up the merge queue
   stackq status | list
+  stackq doctor                                      check the repository is set up for stackq (read-only)
 
 CI (GitHub Actions):
   stackq ci                                          act on the current event
   stackq ci after-merge|dequeued|land|revert --pr N  or run a step directly
   stackq ci schedule                                 one priority pass
+  stackq ci doctor                                   the setup check, with the workflow's own token
 
   stackq version                                     print the release this binary was built from
 
@@ -91,6 +94,8 @@ func main() {
 		err = cmdQueue(args)
 	case "ci":
 		err = cmdCI(args)
+	case "doctor":
+		err = cmdDoctor(args)
 	case "version", "-v", "--version":
 		fmt.Println(versionString())
 		return
@@ -597,6 +602,9 @@ func cmdCI(args []string) error {
 			return nil
 		}
 	}
+	if sub == "doctor" {
+		return runDoctor(r, &c)
+	}
 	if n == 0 && sub != "schedule" && sub != "tick" {
 		return fmt.Errorf("ci %s needs --pr", sub)
 	}
@@ -700,7 +708,7 @@ func fromEvent(poolLabel string, autoLand bool) (string, int, error) {
 		if cmd == "" || cmd == "<nil>" {
 			cmd = "land"
 		}
-		if cmd == "schedule" || cmd == "tick" {
+		if cmd == "schedule" || cmd == "tick" || cmd == "doctor" {
 			return cmd, 0, nil
 		}
 		n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(fmt.Sprint(ev.Inputs["pr"])), "#"))
@@ -710,4 +718,31 @@ func fromEvent(poolLabel string, autoLand bool) (string, int, error) {
 		return cmd, n, nil
 	}
 	return "", 0, nil
+}
+
+func cmdDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	var c common
+	c.register(fs)
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	r, err := c.repo()
+	if err != nil {
+		return err
+	}
+	return runDoctor(r, &c)
+}
+
+func runDoctor(r *git.Repo, c *common) error {
+	trunk := c.trunk(r, "")
+	fmt.Printf("stackq doctor (trunk %s)\n\n", trunk)
+	rs := doctor.Run(&forge.GH{Dir: r.Dir}, r.Dir, doctor.Config{
+		Trunk: trunk, Prefix: c.cfg.Prefix, Landing: c.cfg.Landing, AutoLand: c.cfg.AutoLand,
+		Priority: c.cfg.Priority != nil && c.cfg.Priority.Enabled,
+	})
+	if doctor.Print(os.Stdout, rs) {
+		return errors.New("the setup has problems (✗ above)")
+	}
+	return nil
 }
