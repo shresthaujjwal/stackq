@@ -202,6 +202,10 @@ Patterns follow gitignore semantics:
 - **Incremental mode** takes one queue run per PR, since PRs that don't target `main` can't be queued.
 - **Guard lint** covers Go only, and is a lint, not a proof (SPEC §29.3).
 
+## Reading a run
+
+Each stackq run writes a short summary on its run page in the Actions tab: the command, the event that started it, whether it worked, and what it did (the last 200 lines; the full log is in the job). Open the newest `stackq` run to see why a stack is or is not moving.
+
 ## Checking the setup
 
 `stackq doctor` checks, without changing anything, that the repository is set up the way stackq needs: the config, a merge queue on trunk (and a note on required status checks, which need an App or PAT token), auto-merge and rebase merging, whether Actions may open PRs, the workflow files (the `checks: read` / `statuses: read` permissions, CI triggered on `push`, `merge_group` and `workflow_dispatch`, the CI name `workflow_run` waits for) and the `stackq:split` and `stackq:plan` labels. Each finding is ✓, ! (warning), ✗ (problem) or ? (could not check, with what to look at by hand), and any ✗ makes it exit non-zero. Run it locally, or from the Actions tab (the `stackq` workflow, command `doctor`) to check with the workflow's own token.

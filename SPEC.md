@@ -730,6 +730,8 @@ Steps:
 3. For a source build, `go build -o $RUNNER_TEMP/stackq ./cmd/stackq` in the action's own path. Then `stackq version`.
 4. Set git `user.name` and `user.email` if they're unset, then run `stackq $STACKQ_COMMAND $STACKQ_ARGS` with `GH_TOKEN` set.
 
+**Job summary.** When `GITHUB_STEP_SUMMARY` is set, every stackq command appends a section to the job summary: the command and its arguments, the event that started the run, the result (✓ done or ✗ failed with the error) and its output, capped at the last 200 lines, in a code block whose fence is longer than any backtick run in the text. Runs whose job is skipped by `if` write nothing, because stackq never starts.
+
 Releases are produced by `.github/workflows/release.yml` (§15.5).
 
 ### 15.5 Releases (`.github/workflows/release.yml`)

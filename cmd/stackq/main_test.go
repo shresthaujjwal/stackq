@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,5 +94,37 @@ func TestWithoutFlagDropsTheFlagAndItsValue(t *testing.T) {
 	got := strings.Join(withoutFlag([]string{"--max-lines", "300", "--markdown", "p.md", "-markdown=q.md", "--from", "x"}, "markdown"), " ")
 	if got != "--max-lines 300 --from x" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestWriteSummaryAppendsTheOutcomeAndTheLog(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "summary.md")
+	if err := os.WriteFile(p, []byte("earlier step\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSummary(p, "ci", []string{"tick"}, "workflow_dispatch", "- stack shop: landing\n", nil); err != nil {
+		t.Fatal(err)
+	}
+	var long []string
+	for i := 0; i < summaryLines+5; i++ {
+		long = append(long, fmt.Sprintf("line %d", i))
+	}
+	if err := writeSummary(p, "ci", nil, "workflow_run", strings.Join(long, "\n"), errors.New("boom ``` here")); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	got := string(b)
+	for _, want := range []string{
+		"earlier step\n### stackq ci tick\n\nEvent: `workflow_dispatch`. Result: ✓ done.\n\n```\n- stack shop: landing\n```\n",
+		"### stackq ci\n\nEvent: `workflow_run`. Result: ✗ failed.\n\n````\nboom ``` here\n````\n",
+		fmt.Sprintf("Last %d of %d lines", summaryLines, summaryLines+5),
+		"```\nline 5\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "line 4\n") {
+		t.Errorf("summary keeps lines beyond the cap:\n%s", got)
 	}
 }
