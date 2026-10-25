@@ -3,10 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -39,6 +41,7 @@ const usage = `stackq: split a big branch into stacked PRs and land them through
 
 Local workflow:
   stackq plan  [--from BRANCH] [--max-lines N]       preview the split
+               [--markdown FILE]                     also write it as a PR comment body
   stackq split [--from BRANCH] [--check CMD]         create the stack branches
   stackq push  [--draft] [--close-source]            push branches, open/retarget PRs,
                                                      link (and optionally close) the original PR
@@ -222,8 +225,12 @@ func cmdSplit(args []string, dry bool) error {
 	force := fs.Bool("force", false, "replace existing branches/stack of the same name")
 	fromPR := fs.Int("from-pr", 0, "the original PR (default: found on push from the source branch)")
 	landing := fs.String("landing", "", `"atomic" (whole stack lands as one queue entry; default) or "incremental"`)
+	markdown := fs.String("markdown", "", "plan: also write the preview to FILE as a PR comment body")
 	if err := parse(fs, args); err != nil {
 		return err
+	}
+	if *markdown != "" && !dry {
+		return fmt.Errorf("--markdown is for stackq plan")
 	}
 	r, err := c.repo()
 	if err != nil {
@@ -282,9 +289,14 @@ func cmdSplit(args []string, dry bool) error {
 	if err != nil {
 		return err
 	}
-	printPlan(src, baseRef, plan)
+	printPlan(os.Stdout, src, baseRef, plan)
 	if dry {
-		fmt.Println("\nDry run. Create the branches with: stackq split " + strings.Join(args, " "))
+		if *markdown != "" {
+			if err := os.WriteFile(*markdown, []byte(planComment(src, baseRef, *maxLines, plan)), 0o644); err != nil {
+				return err
+			}
+		}
+		fmt.Println("\nDry run. Create the branches with: stackq split " + strings.Join(withoutFlag(args, "markdown"), " "))
 		return nil
 	}
 	fmt.Println()
@@ -303,8 +315,47 @@ func cmdSplit(args []string, dry bool) error {
 	return nil
 }
 
-func printPlan(src, base string, p *split.Plan) {
-	fmt.Printf("Split %s into %d slices on %s (fork point %s):\n", src, len(p.Slices), base, git.Short(p.Base))
+// withoutFlag drops -name/--name and its value (or -name=value) from args.
+func withoutFlag(args []string, name string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		a := strings.TrimLeft(args[i], "-")
+		switch {
+		case args[i] != a && a == name:
+			i++
+		case args[i] != a && strings.HasPrefix(a, name+"="):
+		default:
+			out = append(out, args[i])
+		}
+	}
+	return out
+}
+
+// PlanMarker starts the PR comment that previews a split, so the workflow
+// can update the comment instead of adding another one.
+const PlanMarker = "<!-- stackq:plan -->"
+
+// planComment is the preview as a PR comment body: the plan in a code block
+// and how to create the stack.
+func planComment(src, base string, maxLines int, p *split.Plan) string {
+	var out bytes.Buffer
+	printPlan(&out, src, base, p)
+	text := out.String()
+	fence := "```"
+	for strings.Contains(text, fence) {
+		fence += "`"
+	}
+	budget := ""
+	if maxLines > 0 {
+		budget = fmt.Sprintf(" with a budget of %d changed lines per slice", maxLines)
+	}
+	return fmt.Sprintf("%s\n**stackq plan**: this PR would become %d stacked PRs%s.\n\n%s\n%s%s\n\n"+
+		"Add the `stackq:split` label to create the stack. The build check from `.stackq.json` runs only then, so a slice that fails it is folded into the next one and the stack can end up with fewer PRs. Add `stackq:plan` again after a push to refresh this preview.\n",
+		PlanMarker, len(p.Slices), budget, fence, text, fence)
+}
+
+func printPlan(w io.Writer, src, base string, p *split.Plan) {
+	fmt.Fprintf(w, "Split %s into %d slices on %s (fork point %s):\n", src, len(p.Slices), base, git.Short(p.Base))
 	for i, s := range p.Slices {
 		add, del := 0, 0
 		for _, f := range s.Files {
@@ -320,24 +371,24 @@ func printPlan(src, base string, p *split.Plan) {
 		case s.Pinned:
 			pin = " [rule]"
 		}
-		fmt.Printf("  %02d %-36s %3d files  +%d/-%d%s\n", i+1, s.Name, len(s.Files), add, del, pin)
+		fmt.Fprintf(w, "  %02d %-36s %3d files  +%d/-%d%s\n", i+1, s.Name, len(s.Files), add, del, pin)
 		for j, f := range s.Files {
 			if j == 6 {
-				fmt.Printf("       … and %d more\n", len(s.Files)-6)
+				fmt.Fprintf(w, "       … and %d more\n", len(s.Files)-6)
 				break
 			}
 			desc := f.Path
 			if f.Status == 'R' {
 				desc = f.OldPath + " → " + f.Path
 			}
-			fmt.Printf("       %c %s\n", f.Status, desc)
+			fmt.Fprintf(w, "       %c %s\n", f.Status, desc)
 		}
 	}
-	for _, w := range p.Warnings {
-		fmt.Printf("  ! %s\n", w)
+	for _, warning := range p.Warnings {
+		fmt.Fprintf(w, "  ! %s\n", warning)
 	}
 	for _, f := range p.Findings {
-		fmt.Printf("  ! slice %02d %s:%d adds %s() outside a flag check\n", f.Slice+1, f.Path, f.Line, f.Call)
+		fmt.Fprintf(w, "  ! slice %02d %s:%d adds %s() outside a flag check\n", f.Slice+1, f.Path, f.Line, f.Call)
 	}
 }
 

@@ -30,7 +30,7 @@ func healthy() fakeAPI {
 		"repos/{owner}/{repo}":                              `{"default_branch":"main","allow_auto_merge":true,"allow_rebase_merge":true,"delete_branch_on_merge":true}`,
 		"repos/{owner}/{repo}/rules/branches/main":          `[{"type":"merge_queue","parameters":{"merge_method":"REBASE"}}]`,
 		"repos/{owner}/{repo}/actions/permissions/workflow": `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":true}`,
-		"repos/{owner}/{repo}/labels?per_page=100":          `[{"name":"bug"},{"name":"stackq:split"}]`,
+		"repos/{owner}/{repo}/labels?per_page=100":          `[{"name":"bug"},{"name":"stackq:split"},{"name":"stackq:plan"}]`,
 		"repos/{owner}/{repo}/branches/main":                `{"protection":{"required_status_checks":{"contexts":[]}}}`,
 	}}
 }
