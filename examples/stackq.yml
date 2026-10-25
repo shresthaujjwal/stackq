@@ -69,7 +69,8 @@ jobs:
           token: ${{ env.TOKEN }}
 
       # Pushes made with the built-in token do not start pull_request
-      # workflows. Start CI on any stack branch whose current commit has no run.
+      # workflows. Start CI on any stack branch whose current commit has no run that
+      # actually ran (a run waiting for approval does not count).
       # Harmless when a PAT or an App token is used.
       - name: Start CI on stack branches
         env:
@@ -78,7 +79,8 @@ jobs:
           gh pr list --state open --json headRefName,headRefOid \
             --jq '.[] | select(.headRefName | startswith("stack/")) | "\(.headRefName) \(.headRefOid)"' |
           while read -r branch sha; do
-            seen=$(gh run list --workflow ci.yml --branch "$branch" --json headSha --jq ".[] | select(.headSha == \"$sha\") | .headSha" | head -n1)
+            # A run waiting for approval (action_required) has not run any checks.
+            seen=$(gh run list --workflow ci.yml --branch "$branch" --json headSha,conclusion --jq ".[] | select(.headSha == \"$sha\" and .conclusion != \"action_required\") | .headSha" | head -n1)
             if [ -z "$seen" ]; then
               gh workflow run ci.yml --ref "$branch" || true
             fi

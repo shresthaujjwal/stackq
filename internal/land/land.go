@@ -282,6 +282,12 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 			problems = append(problems, fmt.Sprintf("part %d #%d: checks are failing", idx, p.Number))
 		case "pending":
 			problems = append(problems, fmt.Sprintf("part %d #%d: checks are still running", idx, p.Number))
+		case "none":
+			// Nobody is watching an automatic landing, so "no checks yet"
+			// (CI not started, or waiting for approval) is not green.
+			if auto {
+				problems = append(problems, fmt.Sprintf("part %d #%d: no checks have reported yet", idx, p.Number))
+			}
 		}
 		if i > 0 {
 			below, above := c.remoteRef(parts[i-1].HeadRef), c.remoteRef(p.HeadRef)

@@ -474,6 +474,8 @@ func TestAutoLandWaitsQuietlyThenLandsOnce(t *testing.T) {
 	quiet("checks running")
 	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "failure" })
 	quiet("checks failing")
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "none" })
+	quiet("no checks reported yet")
 	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "success" })
 
 	if err := run.AutoLand(); err != nil {
@@ -523,5 +525,16 @@ func TestAutoLandWithoutApprovalsWhenAllowed(t *testing.T) {
 	lax2 := &land.Runner{Repo: fx2.dev, Forge: fx2.f, Remote: "origin", AllowUnreviewed: true}
 	if err := lax2.AutoLand(); err != nil || len(fx2.f.Enqueued) != 0 {
 		t.Fatalf("red checks must still block: %v %v", err, fx2.f.Enqueued)
+	}
+}
+
+func TestManualLandStillAcceptsPartsWithoutChecks(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	for i := 0; i < 3; i++ {
+		fx.f.SetDetails(prBy(t, fx, i).Number, func(d *forge.Details) { d.Checks = "none" })
+	}
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := run.Land(prBy(t, fx, 0).Number); err != nil || len(fx.f.Enqueued) != 1 {
+		t.Fatalf("a person running land can accept parts with no CI: %v %v", err, fx.f.Enqueued)
 	}
 }

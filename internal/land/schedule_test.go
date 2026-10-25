@@ -186,3 +186,26 @@ func TestSchedulerWaitingPRNeedsMergeQueue(t *testing.T) {
 		t.Fatal("a waiting PR with no merge queue should still be an error")
 	}
 }
+
+// allowUnreviewed means the repo has no reviewer, so the pool must not wait
+// for an approval that can never come. (Found in the shop sandbox, where a
+// landed stack sat in the pool as "waiting for approval".)
+func TestSchedulerAllowUnreviewedAlsoSkipsThePoolApprovalWait(t *testing.T) {
+	newFixture := func() (*forge.Fake, int) {
+		f := forge.NewFake()
+		n := addPR(f, "fix/typo", "main", "Fix typo", "", "cy", 2, 1, time.Minute)
+		f.SetDetails(n, func(d *forge.Details) { d.Approvals = nil })
+		return f, n
+	}
+	f, _ := newFixture()
+	strict := &land.Runner{Forge: f, Prio: prioCfg(), Now: func() time.Time { return t0 }}
+	if _, err := strict.Schedule("main", false); err != nil || len(f.Enqueued) != 0 {
+		t.Fatalf("an unapproved PR must wait by default: %v %v", err, f.Enqueued)
+	}
+
+	f, n := newFixture()
+	lax := &land.Runner{Forge: f, Prio: prioCfg(), Now: func() time.Time { return t0 }, AllowUnreviewed: true}
+	if _, err := lax.Schedule("main", false); err != nil || len(f.Enqueued) != 1 || f.Enqueued[0] != n {
+		t.Fatalf("allowUnreviewed should queue it: %v %v", err, f.Enqueued)
+	}
+}
