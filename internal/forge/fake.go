@@ -27,6 +27,9 @@ type Fake struct {
 	EnqueueErr error
 	// QueueErr makes Queue fail, as when the branch has no merge queue.
 	QueueErr error
+	// PoolLag makes ListPool return nothing, as when the label search has not
+	// indexed a just-added label yet.
+	PoolLag bool
 	// HeadSHA resolves a branch to its current tip so open PRs track pushes.
 	HeadSHA func(branch string) string
 }
@@ -156,6 +159,9 @@ func (f *Fake) Enqueue(pr PR, o EnqueueOptions) error {
 func (f *Fake) ListPool(label string) ([]PR, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.PoolLag {
+		return nil, nil
+	}
 	var out []PR
 	for n, p := range f.PRs {
 		if !p.Open() || !f.Labels[n][label] {

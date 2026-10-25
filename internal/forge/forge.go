@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -90,6 +91,17 @@ type Forge interface {
 type GH struct {
 	Dir  string
 	Repo string // optional owner/name; otherwise gh infers it from the git remote
+	// Log receives notes about fallbacks, such as the error that made
+	// Enqueue use auto-merge. Nil means os.Stderr.
+	Log io.Writer
+}
+
+func (g *GH) logf(format string, a ...any) {
+	w := g.Log
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, format+"\n", a...)
 }
 
 func (g *GH) run(stdin string, args ...string) ([]byte, error) {
@@ -337,6 +349,10 @@ func (g *GH) Enqueue(pr PR, o EnqueueOptions) error {
 	}
 	_, errA := g.run("", "api", "graphql", "-f", "query="+autoMergeMutation, "-f", "id="+pr.NodeID)
 	if errA == nil {
+		// Auto-merge is not the queue: GitHub adds the PR once its own rules
+		// are met, so say why the direct enqueue was not used.
+		g.logf("! could not enqueue #%d directly (%v); enabled auto-merge instead, GitHub queues it once its requirements are met",
+			pr.Number, strings.TrimSpace(errQ.Error()))
 		return nil
 	}
 	return fmt.Errorf("could not enqueue #%d: %v; auto-merge fallback also failed: %v", pr.Number, errQ, errA)

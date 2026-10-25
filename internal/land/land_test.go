@@ -1,6 +1,7 @@
 package land_test
 
 import (
+	"bytes"
 	"errors"
 	"strconv"
 	"strings"
@@ -602,5 +603,37 @@ func TestFinishLandedLeavesUnlandedStacksAlone(t *testing.T) {
 		if p := prBy(t, fx, i); p.State != "OPEN" || len(fx.f.Comments[p.Number]) != 0 {
 			t.Fatalf("part %d touched before landing: %s %q", i+1, p.State, fx.f.Comments[p.Number])
 		}
+	}
+}
+
+// Right after the label is added the pool search can lag and not find the PR.
+// The log must not claim the stack went into the queue when it did not.
+func TestAtomicLandOnlyClaimsTheQueueWhenThePoolAdmittedIt(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	var log bytes.Buffer
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", Prio: prioCfg(), Log: &log}
+
+	fx.f.PoolLag = true
+	if err := run.Land(prBy(t, fx, 0).Number); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(log.String(), "into the queue") || !strings.Contains(log.String(), "stays in the priority pool") || len(fx.f.Enqueued) != 0 {
+		t.Fatalf("the pool missed the PR, the log must say so:\n%s\nqueued: %v", log.String(), fx.f.Enqueued)
+	}
+
+	// The next pass finds it, as the next event or timer tick would.
+	fx.f.PoolLag = false
+	if _, err := run.Schedule("main", false); err != nil || len(fx.f.Enqueued) != 1 {
+		t.Fatalf("the next pass should queue it: %v %v", err, fx.f.Enqueued)
+	}
+
+	fx2 := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	var log2 bytes.Buffer
+	run2 := &land.Runner{Repo: fx2.dev, Forge: fx2.f, Remote: "origin", Prio: prioCfg(), Log: &log2}
+	if err := run2.Land(prBy(t, fx2, 0).Number); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(log2.String(), "into the queue") || len(fx2.f.Enqueued) != 1 {
+		t.Fatalf("an admitted stack should say it is in the queue:\n%s", log2.String())
 	}
 }
