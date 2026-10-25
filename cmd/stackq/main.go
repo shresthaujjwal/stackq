@@ -139,16 +139,11 @@ type config struct {
 	AllowUnreviewed bool         `json:"allowUnreviewed"`
 	Flags           *split.Flags `json:"flags"`
 	Priority        *prio.Config `json:"priority"`
-	// QueueCI is the CI workflow file stackq starts on the merge queue's
-	// branch after queueing a PR. Set it when stackq runs with the built-in
-	// token, whose queue entries start no merge_group workflows.
-	QueueCI string `json:"queueCI"`
 }
 
 func (c *common) runner(r *git.Repo) *land.Runner {
 	return &land.Runner{Repo: r, Forge: &forge.GH{Dir: r.Dir, Log: os.Stdout}, Remote: c.remote, Log: os.Stdout,
-		Prefix: c.cfg.Prefix, MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority,
-		QueueCI: c.cfg.QueueCI}
+		Prefix: c.cfg.Prefix, MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority}
 }
 
 type common struct {
@@ -752,7 +747,7 @@ func runDoctor(r *git.Repo, c *common) error {
 	fmt.Printf("stackq doctor (trunk %s)\n\n", trunk)
 	rs := doctor.Run(&forge.GH{Dir: r.Dir}, r.Dir, doctor.Config{
 		Trunk: trunk, Prefix: c.cfg.Prefix, Landing: c.cfg.Landing, AutoLand: c.cfg.AutoLand,
-		Priority: c.cfg.Priority != nil && c.cfg.Priority.Enabled, QueueCI: c.cfg.QueueCI,
+		Priority: c.cfg.Priority != nil && c.cfg.Priority.Enabled,
 	})
 	if doctor.Print(os.Stdout, rs) {
 		return errors.New("the setup has problems (✗ above)")

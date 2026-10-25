@@ -51,13 +51,8 @@ type Runner struct {
 	Prio *prio.Config
 	// Prefix is the branch prefix of stack branches, "stack/{name}/" by default.
 	Prefix string
-	// QueueCI is the CI workflow file to start on the merge queue's branch
-	// after an enqueue (queueci.go); empty means GitHub starts it.
-	QueueCI string
-	// QueueWait is how long to wait for that branch; default one minute.
-	QueueWait time.Duration
-	Now       func() time.Time
-	Log       io.Writer
+	Now    func() time.Time
+	Log    io.Writer
 }
 
 // markerOf returns the stack marker of p only if p can really be part of a
@@ -435,10 +430,7 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 			}
 		case statePool:
 			c.setStatus(lander, statusPool(len(parts)))
-		case stateQueued:
-			c.setStatus(lander, statusLanding(len(parts)))
-			c.startQueueCI(lander, m.Trunk, 0)
-		case stateAutoMerge:
+		case stateQueued, stateAutoMerge:
 			c.setStatus(lander, statusLanding(len(parts)))
 		}
 		c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
