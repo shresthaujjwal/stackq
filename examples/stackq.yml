@@ -53,20 +53,21 @@ jobs:
       (github.event_name == 'pull_request' && github.event.action != 'labeled' &&
        (github.event.action == 'dequeued' || github.event.pull_request.merged == true))
     runs-on: ubuntu-latest
-    env:
-      TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0 # rebasing needs history; on huge repos add `filter: blob:none`
-          token: ${{ env.TOKEN }}
+          token: ${{ secrets.STACKQ_TOKEN || github.token }}
+          # stackq gives git the token for the one command that needs it, so it
+          # is not stored in .git/config where any later command could read it.
+          persist-credentials: false
 
       # Runs the newest stackq release. To pin one, add `version: v0.1.1`
       # (or use `@v0.1.1`); the release notes list what changed.
       - uses: YOUR_ORG/stackq@v0
         with:
-          token: ${{ env.TOKEN }}
+          token: ${{ secrets.STACKQ_TOKEN || github.token }}
 
       # Pushes made with the built-in token do not start pull_request
       # workflows. Start CI on any stack branch whose current commit has no run that
@@ -74,7 +75,7 @@ jobs:
       # Harmless when a PAT or an App token is used.
       - name: Start CI on stack branches
         env:
-          GH_TOKEN: ${{ env.TOKEN }}
+          GH_TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
         run: |
           gh pr list --state open --json headRefName,headRefOid \
             --jq '.[] | select(.headRefName | startswith("stack/")) | "\(.headRefName) \(.headRefOid)"' |

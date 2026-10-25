@@ -38,7 +38,7 @@ func (c *Runner) Revert(n int, o RevertOptions) (forge.PR, error) {
 	if err != nil {
 		return forge.PR{}, err
 	}
-	m, isStack := stack.ParseMarker(pr.Body)
+	m, isStack := c.markerOf(pr)
 	trunk := pr.BaseRef
 	if isStack {
 		trunk = m.Trunk

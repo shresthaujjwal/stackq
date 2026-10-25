@@ -33,6 +33,9 @@ type PR struct {
 	ChangedFiles int
 	Draft        bool
 	CreatedAt    time.Time
+	// CrossRepo is true when the head branch lives in a fork. Anyone can open
+	// such a PR with any body, so stackq never treats one as part of a stack.
+	CrossRepo bool
 }
 
 // QueueEntry is one PR in GitHub's merge queue.
@@ -122,7 +125,7 @@ func (g *GH) run(stdin string, args ...string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-const prFields = "number,id,title,body,headRefName,baseRefName,headRefOid,state"
+const prFields = "number,id,title,body,headRefName,baseRefName,headRefOid,state,isCrossRepository"
 
 type ghPR struct {
 	Number      int    `json:"number"`
@@ -133,11 +136,13 @@ type ghPR struct {
 	BaseRefName string `json:"baseRefName"`
 	HeadRefOid  string `json:"headRefOid"`
 	State       string `json:"state"`
+	// True when the head branch is in a fork.
+	IsCrossRepository bool `json:"isCrossRepository"`
 }
 
 func (p ghPR) pr() PR {
 	return PR{Number: p.Number, NodeID: p.ID, Title: p.Title, Body: p.Body, HeadRef: p.HeadRefName,
-		BaseRef: p.BaseRefName, HeadSHA: p.HeadRefOid, State: p.State}
+		BaseRef: p.BaseRefName, HeadSHA: p.HeadRefOid, State: p.State, CrossRepo: p.IsCrossRepository}
 }
 
 func (g *GH) list(state, limit string) ([]PR, error) {

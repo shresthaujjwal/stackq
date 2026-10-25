@@ -37,7 +37,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
       with:
         go-version: stable
         cache: false
@@ -87,5 +87,7 @@ runs:
       run: |
         git config user.name  >/dev/null || git config user.name  "stackq[bot]"
         git config user.email >/dev/null || git config user.email "stackq-bot@users.noreply.github.com"
+        # The command and args are split on spaces on purpose; never expand globs.
+        set -f
         # shellcheck disable=SC2086
         "$RUNNER_TEMP/stackq" $STACKQ_COMMAND $STACKQ_ARGS

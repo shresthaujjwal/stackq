@@ -134,7 +134,7 @@ type config struct {
 
 func (c *common) runner(r *git.Repo) *land.Runner {
 	return &land.Runner{Repo: r, Forge: &forge.GH{Dir: r.Dir, Log: os.Stdout}, Remote: c.remote, Log: os.Stdout,
-		MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority}
+		Prefix: c.cfg.Prefix, MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority}
 }
 
 type common struct {

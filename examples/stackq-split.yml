@@ -60,30 +60,33 @@ jobs:
        !startsWith(github.event.pull_request.head.ref, 'stack/'))
     runs-on: ubuntu-latest
     env:
-      TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
       BRANCH: ${{ inputs.branch || github.event.pull_request.head.ref }}
       # 0 when started by hand: stackq then looks up the branch's open PR.
       SOURCE_PR: ${{ github.event.pull_request.number || '0' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.BRANCH }}
           fetch-depth: 0 # the planner needs the merge base and history
-          token: ${{ env.TOKEN }}
+          token: ${{ secrets.STACKQ_TOKEN || github.token }}
+          # The build check runs commands from .stackq.json on this branch. Keep the
+          # token out of .git/config; stackq hands it to git only when it fetches
+          # or pushes.
+          persist-credentials: false
 
       # Runs the newest stackq release; add `version: v0.1.1` to pin one.
       # The slice build check comes from "check" in .stackq.json.
       - name: Split
         uses: YOUR_ORG/stackq@v0
         with:
-          token: ${{ env.TOKEN }}
+          token: ${{ secrets.STACKQ_TOKEN || github.token }}
           command: split
           args: --max-lines ${{ inputs.max_lines || '400' }} --from-pr ${{ env.SOURCE_PR }} ${{ inputs.force && '--force' || '' }}
 
       - name: Push and open the PRs
         uses: YOUR_ORG/stackq@v0
         with:
-          token: ${{ env.TOKEN }}
+          token: ${{ secrets.STACKQ_TOKEN || github.token }}
           command: push
           args: --from-pr ${{ env.SOURCE_PR }} ${{ inputs.draft && '--draft' || '' }} ${{ (github.event_name == 'pull_request' || inputs.close_source) && '--close-source' || '' }}
 
@@ -93,7 +96,7 @@ jobs:
       # Harmless when a PAT or an App token is used.
       - name: Start CI on the stack branches
         env:
-          GH_TOKEN: ${{ env.TOKEN }}
+          GH_TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
         run: |
           gh pr list --state open --json headRefName,headRefOid \
             --jq '.[] | select(.headRefName | startswith("stack/")) | "\(.headRefName) \(.headRefOid)"' |
@@ -109,13 +112,13 @@ jobs:
       - name: Remove the label
         if: always() && github.event_name == 'pull_request'
         env:
-          GH_TOKEN: ${{ env.TOKEN }}
+          GH_TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
         run: gh pr edit "$SOURCE_PR" --remove-label stackq:split || true
 
       - name: Say so on the PR if it failed
         if: failure() && github.event_name == 'pull_request'
         env:
-          GH_TOKEN: ${{ env.TOKEN }}
+          GH_TOKEN: ${{ secrets.STACKQ_TOKEN || github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh pr comment "$SOURCE_PR" --body "stackq could not split this PR. See the run: $RUN_URL

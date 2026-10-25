@@ -49,8 +49,32 @@ type Runner struct {
 	KeepBranches bool
 	// Prio routes every enqueue through the priority pool (see schedule.go).
 	Prio *prio.Config
-	Now  func() time.Time
-	Log  io.Writer
+	// Prefix is the branch prefix of stack branches, "stack/{name}/" by default.
+	Prefix string
+	Now    func() time.Time
+	Log    io.Writer
+}
+
+// markerOf returns the stack marker of p only if p can really be part of a
+// stack. A PR body is written by whoever opens the PR, so the marker alone proves
+// nothing: anyone can open a PR from a fork with a copied marker and a higher
+// index, and without this check stackq would treat it as the stack's lander and
+// queue it. A stack PR's head branch lives in this repository and is named like
+// stackq names its stack branches.
+func (c *Runner) markerOf(p forge.PR) (stack.Marker, bool) {
+	m, ok := stack.ParseMarker(p.Body)
+	if !ok || p.CrossRepo || !strings.HasPrefix(p.HeadRef, c.branchPrefix(m.Stack)) {
+		return stack.Marker{}, false
+	}
+	return m, true
+}
+
+func (c *Runner) branchPrefix(stackName string) string {
+	prefix := c.Prefix
+	if prefix == "" {
+		prefix = "stack/{name}/"
+	}
+	return strings.ReplaceAll(prefix, "{name}", stackName)
 }
 
 func (c *Runner) logf(format string, a ...any) {
@@ -74,7 +98,7 @@ func (c *Runner) loadStack(name string) (*stackPRs, error) {
 	sp := &stackPRs{marks: map[int]stack.Marker{}}
 	seen := map[int]bool{}
 	for _, p := range all {
-		if m, ok := stack.ParseMarker(p.Body); ok && m.Stack == name && !seen[p.Number] {
+		if m, ok := c.markerOf(p); ok && m.Stack == name && !seen[p.Number] {
 			seen[p.Number] = true
 			sp.prs = append(sp.prs, p)
 			sp.marks[p.Number] = m
@@ -133,7 +157,7 @@ func (c *Runner) Land(n int) error {
 	if err != nil {
 		return err
 	}
-	m, isStack := stack.ParseMarker(pr.Body)
+	m, isStack := c.markerOf(pr)
 	if isStack && m.Atomic() {
 		return c.landAtomic(m)
 	}
@@ -180,7 +204,7 @@ func (c *Runner) AutoLand() error {
 	byName := map[string]stack.Marker{}
 	var names []string
 	for _, p := range open {
-		m, ok := stack.ParseMarker(p.Body)
+		m, ok := c.markerOf(p)
 		if !ok || !m.Atomic() {
 			continue
 		}
@@ -214,7 +238,7 @@ func (c *Runner) FinishLanded() error {
 	byName := map[string]stack.Marker{}
 	var names []string
 	for _, p := range open {
-		m, ok := stack.ParseMarker(p.Body)
+		m, ok := c.markerOf(p)
 		if !ok || !m.Atomic() {
 			continue
 		}
@@ -437,7 +461,7 @@ func (c *Runner) AfterMerge(n int) error {
 		c.logf("#%d is not merged; nothing to do", n)
 		return nil
 	}
-	m, ok := stack.ParseMarker(pr.Body)
+	m, ok := c.markerOf(pr)
 	if !ok {
 		c.logf("#%d is not part of a stackq stack; nothing to do", n)
 		return nil
@@ -763,7 +787,7 @@ func (c *Runner) Dequeued(n int) error {
 	if pr.Merged() {
 		return nil
 	}
-	m, ok := stack.ParseMarker(pr.Body)
+	m, ok := c.markerOf(pr)
 	if !ok {
 		return nil
 	}

@@ -8,7 +8,6 @@ import (
 
 	"stackq/internal/forge"
 	"stackq/internal/prio"
-	"stackq/internal/stack"
 )
 
 func (c *Runner) now() time.Time {
@@ -150,7 +149,7 @@ func (c *Runner) eligible(p forge.PR, trunk string, stacks map[string]*stackPRs)
 	if p.Draft {
 		return false, "draft"
 	}
-	if m, ok := stack.ParseMarker(p.Body); ok && m.Atomic() && !m.Hold {
+	if m, ok := c.markerOf(p); ok && m.Atomic() && !m.Hold {
 		sp := stacks[m.Stack]
 		if sp == nil {
 			var err error
