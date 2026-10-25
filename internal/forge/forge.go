@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -422,8 +423,12 @@ func (g *GH) ClosePR(n int) error {
 
 const poolFields = prFields + ",author,labels,additions,deletions,changedFiles,isDraft,createdAt"
 
+// ListPool lists the open PRs that carry label. It filters here instead of
+// passing --label: gh turns that flag into a search query, and the search
+// index trails label changes by seconds, so a PR labelled a moment ago was
+// missing and sat in the pool until some later event ran another pass.
 func (g *GH) ListPool(label string) ([]PR, error) {
-	out, err := g.run("", "pr", "list", "--state", "open", "--label", label, "--limit", "200", "--json", poolFields)
+	out, err := g.run("", "pr", "list", "--state", "open", "--limit", "500", "--json", poolFields)
 	if err != nil {
 		return nil, err
 	}
@@ -454,7 +459,13 @@ func (g *GH) ListPool(label string) ([]PR, error) {
 		}
 		prs[i] = p
 	}
-	return prs, nil
+	pool := prs[:0]
+	for _, p := range prs {
+		if slices.Contains(p.Labels, label) {
+			pool = append(pool, p)
+		}
+	}
+	return pool, nil
 }
 
 const queueQuery = `query($owner: String!, $name: String!, $branch: String!) {
