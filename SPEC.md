@@ -925,7 +925,7 @@ Exit codes: 0 for success, 1 for any error (message on stderr prefixed `stackq:`
 
 Precedence: flags, then config, then built-in defaults.
 
-`autoLand` (bool, default false): in atomic mode, land a stack by itself once every part is approved and green. `stackq ci tick` runs on each review, finished CI run and timer tick. It lands every open atomic stack that passes the same gates as `stackq land`, and leaves the others alone without a comment, a label or an error. A stack whose lander already targets trunk (or is in the queue) is skipped, so repeated events queue it once. If the enqueue itself failed after the retarget, run `stackq land` by hand. Pool PRs get their normal priority pass in the same tick.
+`autoLand` (bool, default false): in atomic mode, land a stack by itself once every part is approved and green. `stackq ci tick` runs on each review, finished CI run and timer tick. It lands every open atomic stack that passes the same gates as `stackq land`, and leaves the others alone without a comment, a label or an error. Unlike `stackq land`, it also waits while a part has no checks reported at all (CI not started yet, or waiting for approval); without that, a stack could be queued before any CI ran on its parts. A repo whose parts never get checks should land by hand. A stack whose lander already targets trunk (or is in the queue) is skipped, so repeated events queue it once. If the enqueue itself failed after the retarget, run `stackq land` by hand. Pool PRs get their normal priority pass in the same tick.
 
 ---
 
