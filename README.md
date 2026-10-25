@@ -205,7 +205,7 @@ Patterns follow gitignore semantics:
 stackq runs with a token that can push branches and change `main` through the merge queue, so it treats everything a stranger can write as hostile:
 
 - A stack marker in a PR body counts only for a PR whose head branch is in this repository and is named like a stack branch (`stack/<name>/…`). A PR from a fork with a copied marker is ignored.
-- The build `check` from `.stackq.json` runs without any token in its environment, and with `persist-credentials: false` the token is never written to `.git/config`.
+- The build `check` from `.stackq.json` never runs under a process that holds the token: the Action gives `split` no token, and git commands that get the token ignore hooks and helpers the repository config sets up. With `persist-credentials: false` the token is never written to `.git/config`.
 - Nothing puts `${{ }}` in a shell script, and the examples pin third-party actions to commit SHAs.
 
 Some protection has to come from the repository settings: restrict who can create `stack/**` branches, require review for `.github/workflows/**`, keep default workflow permissions read-only, and use `allowUnreviewed` only in a sandbox. To limit supply-chain risk in a repository that matters, pin an exact stackq version instead of following `latest`. SPEC §22 lists the details.
