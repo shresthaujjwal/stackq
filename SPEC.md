@@ -788,7 +788,7 @@ GitHub does not start workflows for events caused by the built-in `GITHUB_TOKEN`
 
 `Runner.FinishLanded` closes that gap. For every open atomic stack whose lander is merged it checks for leftovers: a part that is still open, or the held PR still targeting a stack branch. If there are any it runs `AfterMerge(lander)`, which is idempotent. A held PR that could not be rebased (labeled `stackq:conflict`) is skipped, so a conflict is reported once, not every tick. A tidy stack is left alone.
 
-**With the built-in token, also note:** the merge queue does not run `merge_group` workflows for entries that token added, so the queue merges without CI on the merged result. A GitHub App or PAT (`STACKQ_TOKEN`) avoids both this and the missing cleanup trigger.
+**With the built-in token, also note:** the merge queue does not run `merge_group` workflows for entries that token added (the sandbox repo has never had a `merge_group` run), so the queue merges without CI on the merged result, or, if the CI check is required, waits for a check that never reports until the entry times out. Set `queueCI` to the CI workflow file: after each enqueue stackq waits up to a minute for the queue's branch (`gh-readonly-queue/<trunk>/pr-<n>-…`, which is trunk as it is now plus the PR) and starts that workflow there through `workflow_dispatch`, unless the commit already has checks. Every `tick` repeats this for queued landers in case the branch appeared later. The check then reports on the merge group's commit, which is what the queue waits for, so what lands has been tested against the latest trunk. A GitHub App or PAT (`STACKQ_TOKEN`) makes this unnecessary, and also restores the cleanup trigger.
 
 ### 15.4 Required repository settings
 
@@ -933,6 +933,7 @@ Exit codes: 0 for success, 1 for any error (message on stderr prefixed `stackq:`
 | `slices` | `[{name, paths[]}]` | none | Pinned, ordered rules (§9.2, §9.5) |
 | `landing` | string | `atomic` | `atomic` or `incremental` (§28) |
 | `minApprovals` | int | 1 | Approvals each part needs before an atomic landing |
+| `queueCI` | string | none | CI workflow file (e.g. `ci.yml`) stackq starts on the merge queue's branch after queueing a PR (§15.3a). Set it when stackq uses the built-in token |
 | `allowUnreviewed` | bool | false | Skip the approval gate for atomic landings, from CI and `land`. Checks, requested changes and stacking are still enforced. For repos that cannot get a second reviewer (sandboxes); GitHub's own branch rules still apply |
 | `keepBranches` | bool | false | Keep part branches after an atomic landing |
 | `flags.paths` | `[]glob` | none | Flag definitions; land first (§29) |
