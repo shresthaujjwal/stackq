@@ -30,10 +30,10 @@ on:
       command:
         description: What to do
         type: choice
-        options: [land, after-merge, revert, schedule, tick, doctor]
+        options: [land, after-merge, revert, schedule, tick, doctor, gc]
         default: land
       pr:
-        description: PR number (not needed for schedule, tick or doctor)
+        description: PR number (not needed for schedule, tick, doctor or gc)
         required: false
         default: "0"
 

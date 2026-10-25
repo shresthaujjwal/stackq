@@ -53,7 +53,7 @@ func (f *Fake) ListPRs(state string) ([]PR, error) {
 	var out []PR
 	for _, p := range f.PRs {
 		f.refresh(p)
-		if state == "all" || p.Open() {
+		if state == "all" || p.Open() || state == "closed" && !p.Open() {
 			out = append(out, *p)
 		}
 	}

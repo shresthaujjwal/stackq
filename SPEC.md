@@ -906,6 +906,7 @@ Stack resolution (`--stack` omitted): the stack containing the current branch, o
 | `land` | `--pr N`, `--min-approvals N`, `--allow-unreviewed` | Atomic: gates every part and queues the lander (§28.2). Incremental: without `--pr`, the first active branch, which must have a PR and have trunk as its parent. |
 | `revert` | `--pr N` (required), `--only`, `--enqueue`, `--force` | §28.5 |
 | `schedule` | `--dry-run`, `--trunk` | One priority pass (§31.5) |
+| `gc` | `--delete`, `--trunk` | List (default) or delete remote branches left behind: the head of a merged PR, a stack or revert branch whose PR was closed, the source of a finished stack. Only when no open PR uses the branch and its tip still equals its last PR's head; deleted with a lease on that tip. Also `ci gc` and the dispatch command `gc`, which delete. |
 | `doctor` | `-C` | Read-only setup check: config, merge queue and required checks on trunk, repository and Actions settings, workflow files, labels. ✓ / ! / ✗ / ?, exit 1 on any ✗. Also `ci doctor` and the dispatch command `doctor`. A setting the token cannot read is reported as ?, never as passing. |
 | `queue` | `--pr N` | Add any PR to the priority pool, then run a pass |
 | `status` | | Per branch: index, ✅/⬜, PR#, commits on its parent, "needs sync" if the parent tip is not an ancestor, "unpushed" if local differs from `PushedSHA`. |
