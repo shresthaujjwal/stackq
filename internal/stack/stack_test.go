@@ -198,6 +198,32 @@ func TestMarkerRoundTripKeepsAuthorText(t *testing.T) {
 	}
 }
 
+func TestStatusSectionSurvivesRestacksAndCanBeRemoved(t *testing.T) {
+	m := stack.Marker{Stack: "s", Index: 2, Total: 3, Parent: "p", Trunk: "main"}
+	author := "My description"
+	b := stack.MergeBody(author, stack.RenderBlock(m, nil))
+	b = stack.MergeStatus(b, "waiting on part 1")
+	b = stack.MergeStatus(b, "in the merge queue")
+	if strings.Count(b, "stackq:status:begin") != 1 || !strings.Contains(b, "in the merge queue") || strings.Contains(b, "waiting on part 1") {
+		t.Fatalf("status not replaced:\n%s", b)
+	}
+	if strings.Index(b, "stackq:end") > strings.Index(b, "stackq:status:begin") {
+		t.Fatalf("status must follow the stack block:\n%s", b)
+	}
+	m.Parent = "main"
+	b = stack.MergeBody(b, stack.RenderBlock(m, nil)) // a restack rewrites the stack block
+	if !strings.Contains(b, "in the merge queue") {
+		t.Fatalf("a restack dropped the status:\n%s", b)
+	}
+	b = stack.MergeStatus(b, "")
+	if strings.Contains(b, "stackq:status") || !strings.HasPrefix(b, author) || strings.Count(b, "stackq:begin") != 1 {
+		t.Fatalf("status not removed cleanly:\n%s", b)
+	}
+	if got := stack.MergeStatus("", "x"); !strings.Contains(got, "x") || stack.MergeStatus(got, "") != "" {
+		t.Fatalf("empty body round trip: %q", got)
+	}
+}
+
 func TestPushLinksAndClosesOriginalPR(t *testing.T) {
 	r := testrepo.GoApp(t)
 	bare := testrepo.WithOrigin(t, r)
