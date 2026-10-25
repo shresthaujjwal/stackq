@@ -33,16 +33,20 @@ inputs:
       back to building from source.
     required: false
     default: latest
+  setup-go:
+    description: >
+      Whether to install Go: `auto` (the default) installs it for `split` and
+      `plan`, whose build check (`check` in .stackq.json) usually needs it, and
+      when stackq has to be built from source. `true` always installs it,
+      `false` only to build from source.
+    required: false
+    default: auto
 
 runs:
   using: composite
   steps:
-    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-      with:
-        go-version: stable
-        cache: false
-
     - name: Get stackq
+      id: get
       shell: bash
       env:
         VERSION: ${{ inputs.version }}
@@ -72,11 +76,38 @@ runs:
           && (cd "$RUNNER_TEMP" && grep " $asset\$" checksums.txt | sed "s# $asset# stackq$ext#" | sha256sum -c --quiet -); then
           chmod +x "$bin"
           echo "stackq: using the released binary ($tag, $asset)"
+          echo "build=false" >> "$GITHUB_OUTPUT"
         else
           [ "$VERSION" = source ] || echo "::warning::stackq: no verified release binary for '$tag'; building from source"
-          (cd "$ACTION_PATH" && go build -o "$bin" ./cmd/stackq)
+          rm -f "$bin"
+          echo "build=true" >> "$GITHUB_OUTPUT"
         fi
-        "$bin" version
+
+    # Installing Go takes about 10 seconds, so it is skipped when the released
+    # binary was downloaded and the command runs no build check.
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      if: >-
+        steps.get.outputs.build == 'true' || inputs.setup-go == 'true' ||
+        (inputs.setup-go == 'auto' && (inputs.command == 'split' || inputs.command == 'plan'))
+      with:
+        go-version: stable
+        cache: false
+
+    - name: Build stackq
+      if: steps.get.outputs.build == 'true'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+        (cd "$ACTION_PATH" && go build -o "$RUNNER_TEMP/stackq$ext" ./cmd/stackq)
+
+    - name: Show the stackq version
+      shell: bash
+      run: |
+        ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+        "$RUNNER_TEMP/stackq$ext" version
 
     - name: Run stackq
       shell: bash
