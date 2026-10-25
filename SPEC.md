@@ -277,7 +277,7 @@ stackq/
 │   │   ├── forge.go             Forge interface + gh CLI implementation
 │   │   └── fake.go              in-memory Forge for tests
 │   └── testrepo/testrepo.go     test fixtures: repos, bare origin, simulated rebase-merge
-├── action.yml                   composite Action: setup-go, build, `stackq ci`
+├── action.yml                   composite Action: download (or build), `stackq ci`
 ├── examples/
 │   ├── stackq.yml               workflow to copy into a consuming repo
 │   └── ci-merge-group.yml       reminder that CI needs the merge_group trigger
@@ -722,10 +722,13 @@ Inputs:
 - `command` (default `ci`): the stackq command to run. `ci` reads the GitHub event; `split`, `push`, `sync`, `status`, `land`, `revert` and `schedule` act on the branch the workflow checked out (use `fetch-depth: 0`). See `examples/stackq-split.yml`.
 - `args`: extra arguments for the command, passed through the environment variable `STACKQ_ARGS` to avoid expression injection. They are split on spaces and quotes are not interpreted, so put anything with spaces (such as `check`) in `.stackq.json`.
 
+- `setup-go` (default `auto`): whether to install Go. `auto` installs it for `split` and `plan`, whose build check usually needs a toolchain, and when stackq must be built from source; `true` always; `false` only for a source build.
+
 Steps:
-1. `actions/setup-go@v5` with Go stable and no cache (the repo's own build checks need a toolchain).
-2. Get the binary. The `version` input (default `latest`) picks a release; when the workflow pins the action to a tag like `@v0.3.1` and the input is `latest`, that exact release is used. The step downloads `stackq_<os>_<arch>` and `checksums.txt` from the release, verifies the SHA-256, and runs `stackq version`. If the download or the checksum fails, or `version` is `source`, it builds from the action's own path instead (`go build -o $RUNNER_TEMP/stackq ./cmd/stackq`) and prints a warning.
-3. Set git `user.name` and `user.email` if they're unset, then run `stackq $STACKQ_COMMAND $STACKQ_ARGS` with `GH_TOKEN` set.
+1. Get the binary. The `version` input (default `latest`) picks a release; when the workflow pins the action to a tag like `@v0.3.1` and the input is `latest`, that exact release is used. The step downloads `stackq_<os>_<arch>` and `checksums.txt` from the release and verifies the SHA-256. If the download or the checksum fails, or `version` is `source`, it prints a warning and asks for a source build.
+2. `actions/setup-go` with Go stable and no cache, only as the `setup-go` input says (installing Go takes about 10 seconds per run).
+3. For a source build, `go build -o $RUNNER_TEMP/stackq ./cmd/stackq` in the action's own path. Then `stackq version`.
+4. Set git `user.name` and `user.email` if they're unset, then run `stackq $STACKQ_COMMAND $STACKQ_ARGS` with `GH_TOKEN` set.
 
 Releases are produced by `.github/workflows/release.yml` (§15.5).
 
