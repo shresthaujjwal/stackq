@@ -772,7 +772,7 @@ Every push to `main` (a merged PR) is tested (`gofmt`, `go vet`, `go test -race`
 | Auto-land once parts are green or approved | `workflow_run` (CI finished on a part), `pull_request_review` |
 | Pool admission | the same run that adds the pool label, and every later `tick` |
 | Cleanup after the queue merges | `workflow_run` for CI on the push to trunk (needs CI to run on `push` to trunk, as `examples/ci-merge-group.yml` does) |
-| Pausing a stack the queue rejected | `pull_request` dequeued |
+| Pausing a stack the queue rejected | `pull_request` dequeued, and every `tick` as a fallback (§28.4) |
 
 The 5-minute `schedule` is a safety net only: GitHub runs schedules late or skips them under load. In the sandbox repo it fired about every two hours (2026-10-24/25).
 | `workflow_dispatch` | `inputs.command` (default `land`; `schedule` and `tick` need no PR), `inputs.pr` (may start with `#`) | that command |
@@ -1610,7 +1610,8 @@ Reviews and checks come from `Forge.Details`: `gh pr view --json latestReviews,s
 ### 28.4 Safety nets in atomic mode
 
 - **A part merged on its own** by mistake: CI rebases the next part onto trunk *and cascades*, rebasing every part above it so the chain stays intact. It queues nothing, and comments a warning. `stackq land` then lands the remainder together.
-- **A dequeued lander:** the comment says nothing from the stack reached trunk. Fix the problem, then run `stackq land` again.
+- **A dequeued lander:** the comment says nothing from the stack reached trunk, and the lander gets `stackq:blocked`. Fix the problem, then run `stackq land` again.
+- **A dequeue nobody handled.** The workflows share one concurrency group, and GitHub keeps only one pending run per group: a newer run replaces an older pending one, so the `dequeued` run can be lost. Every `tick` therefore checks each landing lander: if it is not in the merge queue, not waiting in the priority pool, has no auto-merge pending and has not merged, it is paused exactly as the `dequeued` handler would pause it. Anything uncertain (the queue cannot be read, a lookup fails) counts as still landing. A pause found to be wrong is cleared when the stack lands.
 - **Planned (§30.6): a required status check `stackq/atomic`** that fails on every part except the lander, so a part can't be merged on its own at all.
 
 ### 28.5 Rollback (`stackq revert`)

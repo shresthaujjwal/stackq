@@ -59,6 +59,7 @@ type Details struct {
 	ChangesRequested []string // logins whose latest review requests changes
 	Checks           string   // success, pending, failure or none
 	MergeCommit      string   // the commit GitHub recorded on the base branch
+	AutoMerge        bool     // auto-merge is on and waiting for the PR's requirements
 	Commits          int      // commits in the PR
 }
 
@@ -203,8 +204,9 @@ type ghDetails struct {
 	MergeCommit *struct {
 		Oid string `json:"oid"`
 	} `json:"mergeCommit"`
-	Commits    []json.RawMessage `json:"commits"`
-	HeadRefOid string            `json:"headRefOid"`
+	Commits          []json.RawMessage `json:"commits"`
+	HeadRefOid       string            `json:"headRefOid"`
+	AutoMergeRequest *struct{}         `json:"autoMergeRequest"`
 }
 
 // commitChecks lists the check runs and commit statuses on a commit. The PR's
@@ -252,7 +254,7 @@ func (g *GH) commitChecks(sha string) ([]string, error) {
 }
 
 func (g *GH) Details(n int) (Details, error) {
-	out, err := g.run("", "pr", "view", strconv.Itoa(n), "--json", "latestReviews,statusCheckRollup,mergeCommit,commits,headRefOid")
+	out, err := g.run("", "pr", "view", strconv.Itoa(n), "--json", "latestReviews,statusCheckRollup,mergeCommit,commits,headRefOid,autoMergeRequest")
 	if err != nil {
 		return Details{}, err
 	}
@@ -292,6 +294,7 @@ func (g *GH) Details(n int) (Details, error) {
 		d.MergeCommit = raw.MergeCommit.Oid
 	}
 	d.Commits = len(raw.Commits)
+	d.AutoMerge = raw.AutoMergeRequest != nil
 	return d, nil
 }
 
