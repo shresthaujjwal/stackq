@@ -627,6 +627,36 @@ func TestLanderBodyShowsTheLandingStatus(t *testing.T) {
 	}
 }
 
+// A split opens its PRs one by one, and with a token that starts pull_request
+// CI the first parts can be green before the last one exists. Landing the
+// highest PR that exists would land half the feature.
+func TestAnIncompleteStackIsNotLanded(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	top := prBy(t, fx, 2)
+	hidden := fx.f.PRs[top.Number]
+	delete(fx.f.PRs, top.Number) // the last part has not been created yet
+
+	if err := run.AutoLand(); err != nil {
+		t.Fatalf("auto-land must wait quietly: %v", err)
+	}
+	if len(fx.f.Enqueued) != 0 || prBy(t, fx, 1).BaseRef == "main" {
+		t.Fatalf("an incomplete stack was landed: queued=%v base=%s", fx.f.Enqueued, prBy(t, fx, 1).BaseRef)
+	}
+	err := run.Land(prBy(t, fx, 0).Number)
+	if err == nil || !strings.Contains(err.Error(), "3 of 4 PRs") {
+		t.Fatalf("a manual land must say the stack is incomplete, got %v", err)
+	}
+
+	fx.f.PRs[top.Number] = hidden // the split finishes
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
+	}
+	if lp := prBy(t, fx, 2); lp.BaseRef != "main" || len(fx.f.Enqueued) != 1 {
+		t.Fatalf("the complete stack was not landed: base=%s queued=%v", lp.BaseRef, fx.f.Enqueued)
+	}
+}
+
 func TestAutoLandIgnoresIncrementalStacksAndForeignPRs(t *testing.T) {
 	fx := setup(t) // incremental stack
 	fx.f.CreatePR("someone/else", "main", "unrelated", "no marker here", false)

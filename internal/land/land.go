@@ -108,6 +108,15 @@ func (c *Runner) loadStack(name string) (*stackPRs, error) {
 	return sp, nil
 }
 
+func (sp *stackPRs) anyMerged() bool {
+	for _, p := range sp.prs {
+		if p.Merged() {
+			return true
+		}
+	}
+	return false
+}
+
 // lander is the highest-index PR that is not held back.
 func (sp *stackPRs) lander() (forge.PR, bool) {
 	var best forge.PR
@@ -400,6 +409,16 @@ func statusPool(parts int) string {
 func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 	sp, err := c.loadStack(m.Stack)
 	if err != nil {
+		return err
+	}
+	// A split opens its PRs one after the other. Until every part exists the
+	// highest one is not the stack's top, and landing it would land half a feature.
+	if m.Total > len(sp.prs) && !sp.anyMerged() {
+		err := fmt.Errorf("stack %s has %d of %d PRs so far; it is still being created, or a part was deleted", m.Stack, len(sp.prs), m.Total)
+		if auto {
+			c.logf("- %v", err)
+			return nil
+		}
 		return err
 	}
 	var parts []forge.PR

@@ -775,6 +775,8 @@ Every push to `main` (a merged PR) is tested (`gofmt`, `go vet`, `go test -race`
 | Pausing a stack the queue rejected | `pull_request` dequeued, and every `tick` as a fallback (§28.4) |
 
 The 5-minute `schedule` is a safety net only: GitHub runs schedules late or skips them under load. In the sandbox repo it fired about every two hours (2026-10-24/25).
+
+**A lost `workflow_run` event (seen live).** In one run all seven CI runs of a fresh stack finished and GitHub never started a `stackq` run for them; the stack waited 11 minutes until a manual `tick`, because the cron is no help. Earlier stacks got their run within a minute, so this is GitHub dropping or delaying an event, not a stackq rule. The step that starts CI therefore waits for the runs it started (`gh run watch`) and then dispatches one `tick` itself. It cannot loop: it only dispatches after starting CI, and a tick finds every branch already has a run. The result is that a lost event costs nothing, at the price of a job that stays up for the length of the CI run (the step has a 15-minute timeout).
 | `workflow_dispatch` | `inputs.command` (default `land`; `schedule` and `tick` need no PR), `inputs.pr` (may start with `#`) | that command |
 | anything else | n/a | no-op |
 
@@ -1135,7 +1137,7 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
 - **K13. Priority on live GitHub: the `mergeQueue` GraphQL shape and the pool pass are verified** (2026-10-25). Still unverified: `jump` permissions, and whether a pass triggered by Dependabot can read secrets (§31.7).
 - **K12. Revert relies on `refs/pull/N/head`** to find a PR's commits after its branch is deleted. GitHub keeps these refs, but forks and some mirrors don't.
 - **K6. `--force` deletion of prefix branches** fails if any of them is checked out; the error is the raw git error.
-- **K7. One global concurrency group** serializes all stacks in the repo. Use `stackq-${{ head ref's stack name }}` instead; that needs the stack name, so derive it from the branch prefix.
+- **K7. Concurrency groups drop pending runs (seen live, 2026-10-25).** GitHub keeps one running and **one pending** run per group; a newer pending run cancels the older one, even if the newer run's job is skipped by its `if`. With one shared group `stackq`, a label added while a stackq run was busy lost its split: the same label event also starts `stackq.yml`, whose no-op run took the pending slot and cancelled the split (which never ran, and left the `stackq:split` label on). Fixed in the examples: `stackq-split.yml` has its own group per source PR or branch, and `stackq.yml` gives runs that would do nothing a group of their own (`stackq-skipped-<run id>`). Real stackq runs still share `stackq`; a real run replaced by a newer real run is harmless because every run looks at all stacks, and a lost `dequeued` event is caught by the next tick (§28.4). Landing also refuses a stack that has fewer PRs than its marker's `total` (§28.2), so a split that is still opening its PRs is never landed half-way.
 - **K8. Commit hooks are skipped** at creation (`--no-verify`). This is intended, but document it.
 - **K9. `FullyApplied` treats a branch with zero unique commits as landed.** An intentionally empty slice would be marked landed. That's rare, since `--allow-empty` commits only happen if a slice has no file changes, which can't occur.
 - **K10. No support for multiple children** beyond what the marker allows. The code handles a list of children, but `split` only ever creates linear stacks.
@@ -1611,6 +1613,8 @@ Reviews and checks come from `Forge.Details`: `gh pr view --json latestReviews,s
 - else `pending` if any is still running,
 - else `success`,
 - `none` if there are no checks.
+
+**Incomplete stacks.** A split opens its PRs one after the other. Before landing, every stack must have as many PRs as `total` in its marker (merged ones count). Otherwise the highest PR that exists would be taken for the top, and, with a token that starts `pull_request` CI, the first parts can be green before the last one exists. Automatic landing waits quietly; `stackq land` says "stack X has N of M PRs so far".
 
 ### 28.3 After the queue merges the lander (`AfterMerge` → `finishAtomic`)
 
