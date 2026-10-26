@@ -8,6 +8,12 @@ import (
 )
 
 // Fake is an in-memory Forge for tests.
+// ReadyKey picks one PR and label for Fake.ReadyFor.
+type ReadyKey struct {
+	PR    int
+	Label string
+}
+
 type Fake struct {
 	mu       sync.Mutex
 	PRs      map[int]*PR
@@ -21,6 +27,8 @@ type Fake struct {
 	Jumped []int
 	// Ready overrides ReadyAt per PR; default is the PR's CreatedAt.
 	Ready map[int]time.Time
+	// ReadyFor overrides ReadyAt for one PR and label.
+	ReadyFor map[ReadyKey]time.Time
 	// PRDetails overrides Details per PR; the default is one approval and
 	// passing checks.
 	PRDetails  map[int]Details
@@ -192,6 +200,9 @@ func (f *Fake) Queue(branch string) ([]QueueEntry, error) {
 func (f *Fake) ReadyAt(n int, label string) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if t, ok := f.ReadyFor[ReadyKey{n, label}]; ok {
+		return t, nil
+	}
 	if t, ok := f.Ready[n]; ok {
 		return t, nil
 	}

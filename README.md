@@ -202,6 +202,10 @@ Patterns follow gitignore semantics:
 - **Incremental mode** takes one queue run per PR, since PRs that don't target `main` can't be queued.
 - **Guard lint** covers Go only, and is a lint, not a proof (SPEC §29.3).
 
+## Activation PRs that wait
+
+The held activation PR is never merged by stackq. If it waits longer than `activationReminderDays` (default 7) it gets a comment saying how long it has been ready and how to merge it (`stackq land --pr N`) or close it, and again every `activationReminderDays` after that. `stackq:reminded` is the label that times this. Set `"activationReminderDays": 0` in `.stackq.json` to turn it off. Reminders are sent by ticks, so they need `autoLand` or the priority pool to be on and can come late, never early.
+
 ## Reading a run
 
 Each stackq run writes a short summary on its run page in the Actions tab: the command, the event that started it, whether it worked, and what it did (the last 200 lines; the full log is in the job). Open the newest `stackq` run to see why a stack is or is not moving. The run also carries a one-line annotation (done, or the error), which shows on the PR's checks too.

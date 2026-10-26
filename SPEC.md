@@ -951,6 +951,7 @@ Exit codes: 0 for success, 1 for any error (message on stderr prefixed `stackq:`
 | `minApprovals` | int | 1 | Approvals each part needs before an atomic landing |
 | `allowUnreviewed` | bool | false | Skip the approval gate for atomic landings, from CI and `land`. Checks, requested changes and stacking are still enforced. For repos that cannot get a second reviewer (sandboxes); GitHub's own branch rules still apply |
 | `keepBranches` | bool | false | Keep part branches after an atomic landing |
+| `activationReminderDays` | int | 7 | Days a ready activation PR waits before stackq comments, and between comments. 0 or less turns reminders off (§28.8) |
 | `flags.paths` | `[]glob` | none | Flag definitions; land first (§29) |
 | `flags.activation` | `[]glob` | none | Files that turn features on; held in a hand-merged PR |
 | `flags.guards` | `[]string` | none | Flag-check calls, e.g. `flags.Enabled` |
@@ -1698,6 +1699,17 @@ In CI this is available as `stackq ci revert --pr N` and as the workflow_dispatc
 
 ---
 
+
+### 28.8 Reminders for waiting activation PRs
+
+An activation PR is held on purpose, so nothing else ever mentions it again; they pile up (seven were open at once in the sandbox repo). Every `tick` runs `RemindActivations`:
+
+- It looks at open PRs labeled `stackq:activation` whose marker says `hold` (the label alone is not trusted, since anyone with triage rights can add it).
+- The wait starts when the activation label was last added (`ReadyAt`). Once it is `activationReminderDays` old (default 7), stackq comments: the stack, how many days ago it landed, how to merge (`stackq land --pr N`) or close it, and when it will remind again.
+- The `stackq:reminded` label is the timer, so stackq keeps no other state: after commenting it removes and re-adds the label, and the time of that add starts the next wait. Reminders repeat every `activationReminderDays` until the PR is merged or closed.
+- `activationReminderDays: 0` (or less) turns this off.
+- Ticks run on reviews, finished CI runs and the timer, but only when `autoLand` or the pool is on (§15.3), and the 5-minute cron is unreliable, so a reminder can come late. It does not come early.
+
 ## 29. Feature flags: flags first, activation held
 
 Status: **implemented** for ordering, the held activation PR and a Go guard lint (2026-10-16). Provider checks are planned (§29.5).
@@ -1731,7 +1743,7 @@ Planning (§9.2 step 3.0):
 What `Hold` means:
 - The PR is opened as a **draft**, titled `[<stack> activation] …`, with `"hold":true` in its marker and a 🔒 notice in the body.
 - It is **never queued automatically**, in either landing mode.
-- Once everything else is on trunk, CI rebases it onto trunk, retargets it, labels it `stackq:activation`, and comments that it is ready. A human merges it, or runs `stackq land --pr N`, when it's time to turn the feature on.
+- Once everything else is on trunk, CI rebases it onto trunk, retargets it, labels it `stackq:activation`, and comments that it is ready. A human merges it, or runs `stackq land --pr N`, when it's time to turn the feature on. If it waits longer than `activationReminderDays` (default 7), stackq comments again (§28.8).
 - The atomic lander is the topmost part that isn't held, so the activation never rides along.
 
 The top-of-stack invariant (G2) still holds: the top branch, including activation, equals the source branch. Landing everything except activation leaves trunk equal to the lander's head (tested).
