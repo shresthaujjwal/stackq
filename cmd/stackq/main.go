@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -583,11 +584,23 @@ func cmdSync(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: !*noFetch, RebaseTrunk: *trunk, Log: stdout}); err != nil {
+	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: !*noFetch, RebaseTrunk: *trunk, Forge: syncForge(r, c.remote), Log: stdout}); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "Stack %s is in sync (%d of %d left to land).\n", s.Name, len(s.Active()), len(s.Branches))
 	return nil
+}
+
+// syncForge is the forge sync asks about squash-merged parts, or nil when
+// there is no remote or no gh to ask with (sync then goes by git alone).
+func syncForge(r *git.Repo, remote string) forge.Forge {
+	if remote == "" || !r.HasRemote(remote) {
+		return nil
+	}
+	if _, err := exec.LookPath("gh"); err != nil {
+		return nil
+	}
+	return &forge.GH{Dir: r.Dir, Log: stdout}
 }
 
 func cmdPush(args []string) error {

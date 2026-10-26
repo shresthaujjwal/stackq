@@ -535,7 +535,7 @@ For each active branch: `merged = FullyApplied(trunkRef, branch)`. This is true 
 - rebase-merges (same patch, new SHA),
 - merge commits (same SHAs).
 
-It does **not** hold for squash merges (§24, G1).
+It does **not** hold for squash merges of parts with several commits; `sync` then asks the forge (§24, G1).
 
 ### 11.4 Restack
 
@@ -1161,7 +1161,7 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
 - **K8. Commit hooks are skipped** at creation (`--no-verify`). This is intended, but document it.
 - **K9. `FullyApplied` treats a branch with zero unique commits as landed.** An intentionally empty slice would be marked landed. That's rare, since `--allow-empty` commits only happen if a slice has no file changes, which can't occur.
 - **K10. No support for multiple children** beyond what the marker allows. The code handles a list of children, but `split` only ever creates linear stacks.
-- **G1. Squash merges and local landing detection.** Use the forge to check PR state (`merged`) during `sync` when a token is available, instead of relying only on `git cherry`.
+- **G1. (Done 2026-10-26.)** `sync` uses the forge when `gh` is available (`SyncOptions.Forge`). A part counts as landed if its PR is merged and the PR's head is the branch's tip or its last pushed commit; in an atomic stack the parts below a merged part land with it. A merged PR whose branch has later commits is reported and kept. Forge errors are noted and sync continues on git alone. (A squash of a one-commit part is already recognised by `git cherry`, since the patch is the same; parts with extra commits, such as review fix-ups, are not.)
 - **G2. Hunk-level splitting.** Not supported. The design is in §27.4.
 - **G3. TS path aliases and monorepo package imports.** Read `tsconfig.json` `compilerOptions.paths` and workspace `package.json` names.
 - **G4. No recovery for lost local state.** A `stackq adopt` command could rebuild the JSON from PR markers.

@@ -2,6 +2,7 @@ package stack_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -412,5 +413,116 @@ func TestCleanBetweenChecksStopsOneSlicesBuildOutputHidingAnotherSlicesFailure(t
 	s, clean := build(true)
 	if strings.Contains(clean, "✗") || len(s.Branches) != 6 {
 		t.Fatalf("with cleaning every slice should pass its check on its own (%d branches):\n%s", len(s.Branches), clean)
+	}
+}
+
+// pushed returns a stack that is pushed, with a fake forge that tracks the bare remote.
+func pushed(t *testing.T, landing string) (*git.Repo, *git.Repo, *stack.Stack, *forge.Fake) {
+	t.Helper()
+	r := testrepo.GoApp(t)
+	bare := testrepo.WithOrigin(t, r)
+	p, err := split.Make(r, split.Options{Base: "origin/main", Head: "feature", MaxLines: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := stack.Create(r, p, stack.CreateOptions{Name: "feat", Prefix: "stack/feat/", Trunk: "main", Remote: "origin", Source: "feature", Landing: landing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := forge.NewFake()
+	f.HeadSHA = func(b string) string {
+		out, _ := bare.Run("rev-parse", "--verify", "--quiet", "refs/heads/"+b)
+		return out
+	}
+	if err := stack.Push(r, f, s, stack.PushOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	return r, bare, s, f
+}
+
+func TestSyncSeesAPartThatWasSquashMerged(t *testing.T) {
+	r, bare, s, f := pushed(t, "")
+	bottom := s.Branches[0]
+	// A review fix-up makes the part two commits, so the squash is no longer
+	// one commit with the same patch (git does recognise that simple case).
+	testrepo.Must(t, r, "checkout", "-q", bottom.Name)
+	testrepo.Commit(t, r, "address review", map[string]string{"review-fix.txt": "x\n"})
+	testrepo.Must(t, r, "push", "-q", "origin", bottom.Name)
+	f.GetPR(bottom.PR) // record the head the PR had when it merged
+	testrepo.SquashMerge(t, bare, bottom.Name, false)
+	f.MarkMerged(bottom.PR)
+
+	var log bytes.Buffer
+	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: true, Log: &log}); err != nil {
+		t.Logf("sync without the forge: %v", err)
+	}
+	if s.Branches[0].Merged {
+		t.Fatal("git alone cannot recognise this squash; if it does, this test proves nothing")
+	}
+	log.Reset()
+
+	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: true, Forge: f, Log: &log}); err != nil {
+		t.Fatalf("%v\n%s", err, log.String())
+	}
+	if !s.Branches[0].Merged || !strings.Contains(log.String(), "landed (#") {
+		t.Fatalf("the squash-merged part should count as landed:\n%s", log.String())
+	}
+	if s.Branches[1].Parent != "main" {
+		t.Fatalf("the next part should now sit on trunk, parent is %q", s.Branches[1].Parent)
+	}
+}
+
+func TestSyncKeepsAPartWithCommitsThatWereNotInTheMergedPR(t *testing.T) {
+	r, bare, s, f := pushed(t, "")
+	bottom := s.Branches[0]
+	f.GetPR(bottom.PR)
+	testrepo.SquashMerge(t, bare, bottom.Name, false)
+	f.MarkMerged(bottom.PR)
+	testrepo.Must(t, r, "checkout", "-q", bottom.Name)
+	testrepo.Commit(t, r, "afterthought", map[string]string{"afterthought.txt": "x"})
+
+	var log bytes.Buffer
+	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: true, Forge: f, Log: &log}); err != nil {
+		t.Logf("sync: %v", err)
+	}
+	if s.Branches[0].Merged || !strings.Contains(log.String(), "not in it") {
+		t.Fatalf("work added after the merge must not be dropped:\n%s", log.String())
+	}
+}
+
+func TestSyncLandsEverythingBelowAMergedPartOfAnAtomicStack(t *testing.T) {
+	r, bare, s, f := pushed(t, stack.Atomic)
+	top := len(s.Branches) - 2 // the last part before the held activation, if any
+	for top > 0 && s.Branches[top].Hold {
+		top--
+	}
+	lander := s.Branches[top]
+	f.GetPR(lander.PR)
+	testrepo.SquashMerge(t, bare, lander.Name, false)
+	f.MarkMerged(lander.PR)
+
+	var log bytes.Buffer
+	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: true, Forge: f, Log: &log}); err != nil {
+		t.Logf("sync: %v", err)
+	}
+	for i := 0; i <= top; i++ {
+		if !s.Branches[i].Merged {
+			t.Fatalf("%s is inside the merged lander and should count as landed:\n%s", s.Branches[i].Name, log.String())
+		}
+	}
+}
+
+type brokenForge struct{ *forge.Fake }
+
+func (brokenForge) GetPR(int) (forge.PR, error) { return forge.PR{}, errors.New("no network") }
+
+func TestSyncFallsBackToGitWhenTheForgeFails(t *testing.T) {
+	r, _, s, f := pushed(t, "")
+	var log bytes.Buffer
+	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: true, Forge: brokenForge{f}, Log: &log}); err != nil {
+		t.Fatalf("a failing forge must not fail sync: %v", err)
+	}
+	if !strings.Contains(log.String(), "going by git alone") {
+		t.Fatalf("the failure should be noted:\n%s", log.String())
 	}
 }

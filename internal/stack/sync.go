@@ -16,7 +16,10 @@ type SyncOptions struct {
 	// default: the merge queue tests against the latest trunk anyway, and
 	// restacking on every trunk move just churns CI.
 	RebaseTrunk bool
-	Log         io.Writer
+	// Forge, when set, lets sync see parts that landed by squash, whose
+	// commits git cannot recognise in trunk (G1). Nil means git alone.
+	Forge forge.Forge
+	Log   io.Writer
 }
 
 // Sync brings the local stack up to date: it picks up branches that CI
@@ -69,6 +72,9 @@ func Sync(r *git.Repo, s *Stack, o SyncOptions) error {
 			b.Merged = true
 			fmt.Fprintf(o.Log, "✓ %s has landed in %s\n", b.Name, trunk)
 		}
+	}
+	if o.Forge != nil {
+		markMergedByPR(r, s, o.Forge, o.Log)
 	}
 
 	for _, b := range s.Active() {
@@ -304,4 +310,48 @@ func linkSource(r *git.Repo, f forge.Forge, s *Stack, src forge.PR, o PushOption
 		fmt.Fprintf(o.Log, "✕ closed #%d\n", src.Number)
 	}
 	return nil
+}
+
+// markMergedByPR asks the forge about each part git does not see as landed.
+// A squash or merge commit puts the part's changes in trunk under new commit
+// ids, so the patch comparison above finds nothing. A part counts as landed
+// if its PR is merged and the PR's head is the branch's tip, so work added
+// after the merge is never dropped. In an atomic stack the merged part carries
+// everything below it into trunk, so those parts count as landed too. Errors
+// from the forge are noted and ignored: sync still works from git alone.
+func markMergedByPR(r *git.Repo, s *Stack, f forge.Forge, log io.Writer) {
+	var landedAt = -1
+	for i, b := range s.Branches {
+		if b.Merged || b.Hold || b.PR == 0 || !r.RefExists(b.Name) {
+			continue
+		}
+		pr, err := f.GetPR(b.PR)
+		if err != nil {
+			fmt.Fprintf(log, "! could not ask about #%d (%v); going by git alone\n", b.PR, err)
+			return
+		}
+		if !pr.Merged() {
+			continue
+		}
+		tip, err := r.RevParse(b.Name)
+		if err != nil {
+			continue
+		}
+		if tip != pr.HeadSHA && tip != b.PushedSHA {
+			fmt.Fprintf(log, "! #%d merged, but %s has commits that were not in it; not treating it as landed\n", b.PR, b.Name)
+			continue
+		}
+		b.Merged = true
+		fmt.Fprintf(log, "✓ %s has landed (#%d merged)\n", b.Name, b.PR)
+		landedAt = i
+	}
+	if s.Landing != Atomic || landedAt < 0 {
+		return
+	}
+	for _, b := range s.Branches[:landedAt] {
+		if !b.Merged && !b.Hold {
+			b.Merged = true
+			fmt.Fprintf(log, "✓ %s has landed inside #%d\n", b.Name, s.Branches[landedAt].PR)
+		}
+	}
 }
