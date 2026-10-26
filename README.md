@@ -220,7 +220,7 @@ Each stackq run writes a short summary on its run page in the Actions tab: the c
 
 ## Cleaning up branches
 
-`stackq gc` lists remote branches left behind; `stackq gc --delete` deletes them, and so does the `stackq` workflow run by hand with command `gc` (it uses the workflow's token). A branch is deleted only if no open PR uses it, its tip is still exactly the head of its last PR, and that PR merged, or it is a stack or revert branch whose PR was closed, or it is the source of a stack that is completely finished. Branches that never had a PR are left alone.
+`stackq gc` lists remote branches left behind; `stackq gc --delete` deletes them, and so does the `stackq` workflow run by hand with command `gc` (it uses the workflow's token). A branch is deleted only if no open PR uses it, its tip is still exactly the head of its last PR, and that PR merged, or it is a stack or revert branch whose PR was closed, or it is the source of a stack that is completely finished. Branches that never had a PR are left alone. The same rules, limited to the branches stackq makes itself, run on every tick, so the branch of a one-part stack does not stay behind after the queue merges it (unless `keepBranches` is set).
 
 ## Security
 

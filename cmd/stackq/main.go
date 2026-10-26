@@ -811,7 +811,8 @@ func cmdCI(args []string) error {
 				err = errors.Join(err, serr)
 			}
 		}
-		return errors.Join(err, run.RemindActivations())
+		err = errors.Join(err, run.RemindActivations())
+		return errors.Join(err, run.TidyStackBranches(trunk))
 	case "after-merge":
 		return afterwards(run.AfterMerge(n))
 	case "dequeued":

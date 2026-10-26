@@ -119,3 +119,55 @@ func exists(t *testing.T, bare *git.Repo, branch string) bool {
 	out, _ := bare.Run("rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
 	return out != ""
 }
+
+func TestTidyStackBranchesRemovesAOnePartStacksBranchAndNothingElse(t *testing.T) {
+	dev := testrepo.GoApp(t)
+	bare := testrepo.WithOrigin(t, dev)
+	f := forge.NewFake()
+	f.HeadSHA = func(b string) string {
+		out, _ := bare.Run("rev-parse", "--verify", "--quiet", "refs/heads/"+b)
+		return out
+	}
+	push := func(name string) {
+		t.Helper()
+		testrepo.Must(t, dev, "checkout", "-q", "-B", "work", "main")
+		testrepo.Commit(t, dev, name, map[string]string{"notes/" + strings.ReplaceAll(name, "/", "_") + ".txt": name})
+		testrepo.Must(t, dev, "push", "-q", "origin", "HEAD:refs/heads/"+name)
+	}
+	merged := func(head, body string) {
+		t.Helper()
+		p, err := f.CreatePR(head, "main", head, body, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.MarkMerged(p.Number)
+	}
+	body := stack.RenderBlock(stack.Marker{Stack: "solo", Index: 1, Total: 1, Parent: "main", Trunk: "main", Landing: stack.Atomic}, nil)
+
+	// The queue merged a stack of one part; no open PR is left to trigger cleanup.
+	push("stack/solo/01-ping")
+	merged("stack/solo/01-ping", body)
+	// A merged branch that is not stackq's is left to GitHub's own setting.
+	push("fix/merged")
+	merged("fix/merged", "")
+
+	var log bytes.Buffer
+	run := &land.Runner{Repo: testrepo.Clone(t, bare), Forge: f, Remote: "origin", Log: &log}
+	keep := &land.Runner{Repo: testrepo.Clone(t, bare), Forge: f, Remote: "origin", Log: &log, KeepBranches: true}
+	if err := keep.TidyStackBranches("main"); err != nil || !exists(t, bare, "stack/solo/01-ping") {
+		t.Fatalf("keepBranches must keep the branch: %v", err)
+	}
+	if err := run.TidyStackBranches("main"); err != nil {
+		t.Fatal(err)
+	}
+	if exists(t, bare, "stack/solo/01-ping") {
+		t.Fatalf("the finished stack's branch should be gone:\n%s", log.String())
+	}
+	if !exists(t, bare, "fix/merged") {
+		t.Fatal("a branch that is not stackq's must not be touched")
+	}
+	log.Reset()
+	if err := run.TidyStackBranches("main"); err != nil || log.Len() != 0 {
+		t.Fatalf("with nothing to do a tick must stay quiet: %v %q", err, log.String())
+	}
+}

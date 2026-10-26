@@ -31,6 +31,24 @@ type Stale struct {
 // that moved in the meantime is kept. Only the most recent closed and merged
 // PRs are looked at (the forge's list limit), so very old leftovers may stay.
 func (c *Runner) GC(trunk string, del bool) ([]Stale, error) {
+	return c.gc(trunk, del, false)
+}
+
+// TidyStackBranches deletes the branches stackq itself made (stack and revert
+// branches) once their PRs are merged or closed, by the same rules as GC. A
+// stack of one part has no open PR left after the queue merges it, so the
+// cleanup that follows a landing (which looks at stacks with open PRs) never
+// sees it, and the merge queue's merge starts no "PR merged" run for the
+// built-in token. It is quiet when there is nothing to do, so a tick can run it.
+func (c *Runner) TidyStackBranches(trunk string) error {
+	if c.KeepBranches {
+		return nil
+	}
+	_, err := c.gc(trunk, true, true)
+	return err
+}
+
+func (c *Runner) gc(trunk string, del, onlyStack bool) ([]Stale, error) {
 	out, err := c.Repo.Run("ls-remote", "--heads", c.Remote)
 	if err != nil {
 		return nil, err
@@ -83,7 +101,7 @@ func (c *Runner) GC(trunk string, del bool) ([]Stale, error) {
 	var stale []Stale
 	for branch, sha := range tips {
 		p, ok := last[branch]
-		if inUse[branch] || !ok || p.CrossRepo || p.HeadSHA != sha {
+		if inUse[branch] || !ok || p.CrossRepo || p.HeadSHA != sha || (onlyStack && !c.isStackBranch(branch)) {
 			continue
 		}
 		why := ""
@@ -119,7 +137,9 @@ func (c *Runner) GC(trunk string, del bool) ([]Stale, error) {
 	}
 	switch {
 	case len(stale) == 0:
-		c.logf("no stale branches")
+		if !onlyStack {
+			c.logf("no stale branches")
+		}
 	case !del:
 		c.logf("\n%d stale branches; run again with --delete to delete them", len(stale))
 	}
