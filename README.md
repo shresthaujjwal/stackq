@@ -226,7 +226,7 @@ Some protection has to come from the repository settings: restrict who can creat
 
 ## Releases
 
-Every merged PR is released automatically: tests run, the version goes up (patch by default; put `[minor]` or `[major]` in the PR title for more), and binaries for Linux, macOS and Windows are attached to a GitHub release with a `checksums.txt`. The latest is always at `https://github.com/OWNER/stackq/releases/latest/download/stackq_linux_amd64`, and `stackq version` tells you which release you have.
+Every merged PR that changes more than Markdown is released automatically (a README or SPEC change waits for the next release): tests run, the version goes up (patch by default; put `[minor]` or `[major]` in the PR title for more), and binaries for Linux, macOS and Windows are attached to a GitHub release with a `checksums.txt`. The latest is always at `https://github.com/OWNER/stackq/releases/latest/download/stackq_linux_amd64`, and `stackq version` tells you which release you have.
 
 The Action downloads and verifies that binary instead of compiling stackq on every run. By default (`uses: OWNER/stackq@v0`) it runs the newest release, so there is nothing to bump. For reproducible runs pin one with `version: v0.3.1` or `uses: OWNER/stackq@v0.3.1`. If the download or checksum fails it builds from source. Go is installed only for `split` (its build check usually needs it) and for a source build; set `setup-go: true` if another command's job needs it, or `setup-go: false` if your check needs no Go. See SPEC §15.5.
 
