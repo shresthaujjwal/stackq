@@ -123,9 +123,11 @@ func main() {
 		os.Exit(2)
 	}
 	if summary != "" {
-		if serr := writeSummary(summary, cmd, args, os.Getenv("GITHUB_EVENT_NAME"), log.String(), err); serr != nil {
+		serr := writeSummary(summary, cmd, args, os.Getenv("GITHUB_EVENT_NAME"), log.String(), err)
+		if serr != nil {
 			fmt.Fprintln(os.Stderr, "stackq: job summary:", serr)
 		}
+		fmt.Println(annotation(cmd, args, log.String(), err, serr))
 	}
 	if err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
@@ -388,6 +390,30 @@ func writeSummary(path, cmd string, args []string, event, log string, runErr err
 	return f.Close()
 }
 
+// annotation is the workflow command that puts the run's outcome on the run
+// page and on the PR's checks as one line: a notice, or an error when the
+// command failed. The job summary is only readable in the browser; annotations
+// are also in the API, so a run can be checked without opening the page.
+func annotation(cmd string, args []string, log string, runErr, summaryErr error) string {
+	title := strings.TrimSpace("stackq " + cmd + " " + strings.Join(args, " "))
+	level, msg := "notice", fmt.Sprintf("done; %d lines of output, written to the job summary", strings.Count(strings.TrimRight(log, "\n"), "\n")+1)
+	if strings.TrimSpace(log) == "" {
+		msg = "done; no output"
+	}
+	switch {
+	case runErr != nil && errors.Is(runErr, flag.ErrHelp):
+		msg = "printed the usage"
+	case runErr != nil:
+		level, msg = "error", "failed: "+runErr.Error()
+	}
+	if summaryErr != nil {
+		level, msg = "warning", msg+" (the job summary could not be written: "+summaryErr.Error()+")"
+	}
+	esc := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
+	escProp := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A", ":", "%3A", ",", "%2C")
+	return fmt.Sprintf("::%s title=%s::%s", level, escProp.Replace(title), esc.Replace(msg))
+}
+
 // fenced puts text in a code block whose fence is longer than any run of
 // backticks in it, so the text cannot end the block early.
 func fenced(text string) string {
@@ -396,6 +422,13 @@ func fenced(text string) string {
 		fence += "`"
 	}
 	return fence + "\n" + text + "\n" + fence + "\n"
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // PlanMarker starts the PR comment that previews a split, so the workflow
@@ -411,9 +444,9 @@ func planComment(src, base string, maxLines int, p *split.Plan) string {
 	if maxLines > 0 {
 		budget = fmt.Sprintf(" with a budget of %d changed lines per slice", maxLines)
 	}
-	return fmt.Sprintf("%s\n**stackq plan**: this PR would become %d stacked PRs%s.\n\n%s\n"+
+	return fmt.Sprintf("%s\n**stackq plan**: this PR would become %d stacked %s%s.\n\n%s\n"+
 		"Add the `stackq:split` label to create the stack. The build check from `.stackq.json` runs only then, so a slice that fails it is folded into the next one and the stack can end up with fewer PRs. Add `stackq:plan` again after a push to refresh this preview.\n",
-		PlanMarker, len(p.Slices), budget, fenced(strings.TrimRight(out.String(), "\n")))
+		PlanMarker, len(p.Slices), plural(len(p.Slices), "PR", "PRs"), budget, fenced(strings.TrimRight(out.String(), "\n")))
 }
 
 func printPlan(w io.Writer, src, base string, p *split.Plan) {
