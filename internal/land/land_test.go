@@ -243,6 +243,25 @@ func TestEnqueueFailureIsReported(t *testing.T) {
 	}
 }
 
+func TestFinalEnqueueRefusalReachesThePRInPlainWords(t *testing.T) {
+	fx := setup(t)
+	child := fx.s.Branches[1].PR
+	fx.f.EnqueueErr = &forge.EnqueueError{PR: child, Kind: "draft", Detail: "Pull request is in draft"}
+	if err := fx.queueMerges(t, 0); err == nil {
+		t.Fatal("expected the stack to pause")
+	}
+	if !fx.f.Labels[child][land.LabelBlocked] {
+		t.Fatal("blocked label missing")
+	}
+	var said string
+	for _, c := range fx.f.Comments[child] {
+		said += c
+	}
+	if !strings.Contains(said, "mark it ready for review") {
+		t.Fatalf("the PR should hear the cause, got %q", said)
+	}
+}
+
 func TestDequeuedPausesStack(t *testing.T) {
 	fx := setup(t)
 	pr := fx.s.Branches[0].PR

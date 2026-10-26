@@ -5,6 +5,7 @@ package forge
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -387,10 +388,66 @@ const autoMergeMutation = `mutation($id: ID!) {
   enablePullRequestAutoMerge(input: {pullRequestId: $id}) { pullRequest { number } }
 }`
 
+// EnqueueError is a refusal whose cause GitHub's message names and that
+// auto-merge would hit too, so retrying with auto-merge only adds noise (and,
+// for a stale head, would skip the head check).
+type EnqueueError struct {
+	PR     int
+	Kind   string // closed, draft, stale, missing or forbidden
+	Detail string // GitHub's own message
+}
+
+func (e *EnqueueError) Error() string {
+	switch e.Kind {
+	case "closed":
+		return fmt.Sprintf("#%d is already merged or closed (GitHub: %s)", e.PR, e.Detail)
+	case "draft":
+		return fmt.Sprintf("#%d is a draft; mark it ready for review (GitHub: %s)", e.PR, e.Detail)
+	case "stale":
+		return fmt.Sprintf("#%d changed since it was checked, so it was not queued; stackq will look at it again on its next run (GitHub: %s)", e.PR, e.Detail)
+	case "missing":
+		return fmt.Sprintf("#%d was not found (GitHub: %s)", e.PR, e.Detail)
+	default:
+		return fmt.Sprintf("the token may not queue #%d: give the workflow contents: write and pull-requests: write, or use an App or PAT token as STACKQ_TOKEN (GitHub: %s)", e.PR, e.Detail)
+	}
+}
+
+// IsPermanent reports whether err is an EnqueueError: retrying the same
+// request, or enabling auto-merge instead, cannot work.
+func IsPermanent(err error) bool {
+	var e *EnqueueError
+	return errors.As(err, &e)
+}
+
+// classifyEnqueue maps GitHub's wording (seen on real runs, 2026-10-26) to an
+// EnqueueError, or nil when the message is not one we know to be final. Any
+// other message, such as pending checks, falls back to auto-merge.
+func classifyEnqueue(pr int, msg string) *EnqueueError {
+	m := strings.ToLower(msg)
+	kind := ""
+	switch {
+	case strings.Contains(m, "is closed"), strings.Contains(m, "already merged"):
+		kind = "closed"
+	case strings.Contains(m, "is in draft"), strings.Contains(m, "is a draft"):
+		kind = "draft"
+	case strings.Contains(m, "expected head oid does not match"):
+		kind = "stale"
+	case strings.Contains(m, "could not resolve to a node"):
+		kind = "missing"
+	case strings.Contains(m, "resource not accessible by integration"):
+		kind = "forbidden"
+	default:
+		return nil
+	}
+	return &EnqueueError{PR: pr, Kind: kind, Detail: strings.TrimSpace(msg)}
+}
+
 // Enqueue tries to add the PR to the merge queue directly. If GitHub refuses
-// (usually because required checks on the freshly pushed head are still
-// running), it enables auto-merge instead, which on a merge-queue branch
-// means "join the queue when ready".
+// for a reason that auto-merge would share (the PR is closed, a draft, moved
+// on, missing, or the token may not queue it), it returns an EnqueueError.
+// For anything else (usually because required checks on the freshly pushed
+// head are still running), it enables auto-merge instead, which on a
+// merge-queue branch means "join the queue when ready".
 func (g *GH) Enqueue(pr PR, o EnqueueOptions) error {
 	if pr.NodeID == "" {
 		full, err := g.GetPR(pr.Number)
@@ -407,6 +464,9 @@ func (g *GH) Enqueue(pr PR, o EnqueueOptions) error {
 	_, errQ := g.run("", args...)
 	if errQ == nil {
 		return nil
+	}
+	if ce := classifyEnqueue(pr.Number, errQ.Error()); ce != nil {
+		return ce
 	}
 	if o.Jump {
 		// Auto-merge can't jump; let the caller decide.

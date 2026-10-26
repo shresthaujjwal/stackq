@@ -706,8 +706,19 @@ Incremental landing costs one queue cycle per slice. Atomic landing costs one qu
 
 1. If `NodeID` is missing, fetch it.
 2. Try `enqueuePullRequest(pullRequestId, expectedHeadOid)`.
-3. On any error, try `enablePullRequestAutoMerge(pullRequestId)` with no merge method; the queue decides the method.
-4. If both fail, return a combined error.
+3. Classify the error by GitHub's wording. These are final, because auto-merge would hit the same wall (or, for a moved head, would skip the head check), so Enqueue returns an `EnqueueError` and does not try auto-merge. The wording was recorded from real runs on 2026-10-26:
+
+   | GitHub says | Kind | Meaning |
+   |---|---|---|
+   | `Pull request is closed` (auto-merge: `... is already merged`) | closed | merged or closed already |
+   | `Pull request is in draft` (auto-merge: `... is a draft`) | draft | mark it ready for review |
+   | `... expected head oid does not match the current head oid` | stale | the PR changed since it was checked; the next run looks again |
+   | `Could not resolve to a node ...` | missing | the PR is gone |
+   | `Resource not accessible by integration` | forbidden | the token lacks `contents: write` / `pull-requests: write`; use an App or PAT token |
+
+   The error says what to do and quotes GitHub; it reaches the PR as a comment or the `stackq:blocked` label as before. A `jump` refused for one of these reasons is not retried without the jump.
+4. On any other error (typically required checks still running), try `enablePullRequestAutoMerge(pullRequestId)` with no merge method; the queue decides the method.
+5. If both fail, return a combined error.
 
 `expectedHeadOid` protects against queueing a head that changed after the restack.
 
@@ -1136,7 +1147,7 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
   - Check whether `enablePullRequestAutoMerge` with no `mergeMethod` is accepted on queue branches.
   - Confirm the `dequeued` event fires as expected.
 - **K1. (Wording fixed 2026-10-16.)** The conflict comment now says sync stops and prints the exact rebase command. Still worth adding: a `stackq sync --interactive` that leaves the rebase in progress in the user's worktree, plus `stackq continue`.
-- **K2. The Enqueue fallback swallows every enqueue error.** A permanent failure, such as a closed PR, is retried as auto-merge, and the combined error is noisy. Classify the errors.
+- **K2. (Done 2026-10-26, §14.5.)** Enqueue errors are classified by GitHub's wording: closed, draft, moved head, missing PR and a token without permission are final and skip the auto-merge fallback, which also keeps a moved head from being queued unchecked. Other errors still fall back.
 - **K3. Merged-PR history is capped at the 200 most recent.** Older merged stack PRs lose their ✅ in the nav. This is cosmetic. Fix it by fetching specific PR numbers recorded in the markers, or with a search query.
 - **K4. `--check` artifacts carry over.** Untracked artifacts from one slice's check persist into the next slice's check, which could mask failures (for example, generated code). Fix by running `git clean -fdx` (optional, configurable) before each check, or by running checks in a fresh worktree per slice.
 - **K5. The marker trunk is unvalidated in CI** (§22).
