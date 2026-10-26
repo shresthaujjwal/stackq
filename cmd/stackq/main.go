@@ -24,6 +24,10 @@ import (
 	"stackq/internal/stack"
 )
 
+// stdout is where commands print. In GitHub Actions it also feeds the job
+// summary (see writeSummary).
+var stdout io.Writer = os.Stdout
+
 // Set at release time: -X main.version=v1.2.3 -X main.commit=abc1234.
 var (
 	version = "dev"
@@ -75,6 +79,11 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	var log bytes.Buffer
+	summary := os.Getenv("GITHUB_STEP_SUMMARY")
+	if summary != "" {
+		stdout = io.MultiWriter(os.Stdout, &log)
+	}
 	var err error
 	switch cmd {
 	case "plan":
@@ -113,6 +122,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
 	}
+	if summary != "" {
+		if serr := writeSummary(summary, cmd, args, os.Getenv("GITHUB_EVENT_NAME"), log.String(), err); serr != nil {
+			fmt.Fprintln(os.Stderr, "stackq: job summary:", serr)
+		}
+	}
 	if err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, "stackq:", err)
@@ -145,7 +159,7 @@ type config struct {
 }
 
 func (c *common) runner(r *git.Repo) *land.Runner {
-	return &land.Runner{Repo: r, Forge: &forge.GH{Dir: r.Dir, Log: os.Stdout}, Remote: c.remote, Log: os.Stdout,
+	return &land.Runner{Repo: r, Forge: &forge.GH{Dir: r.Dir, Log: stdout}, Remote: c.remote, Log: stdout,
 		Prefix: c.cfg.Prefix, MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority}
 }
 
@@ -289,29 +303,29 @@ func cmdSplit(args []string, dry bool) error {
 	if err != nil {
 		return err
 	}
-	printPlan(os.Stdout, src, baseRef, plan)
+	printPlan(stdout, src, baseRef, plan)
 	if dry {
 		if *markdown != "" {
 			if err := os.WriteFile(*markdown, []byte(planComment(src, baseRef, *maxLines, plan)), 0o644); err != nil {
 				return err
 			}
 		}
-		fmt.Println("\nDry run. Create the branches with: stackq split " + strings.Join(withoutFlag(args, "markdown"), " "))
+		fmt.Fprintln(stdout, "\nDry run. Create the branches with: stackq split "+strings.Join(withoutFlag(args, "markdown"), " "))
 		return nil
 	}
-	fmt.Println()
+	fmt.Fprintln(stdout)
 	s, err := stack.Create(r, plan, stack.CreateOptions{
 		Name: *name, Prefix: *prefix, Trunk: trunk, Remote: c.remote, Source: src,
-		Check: *check, MergeOnFail: fold, Force: *force, SourcePR: *fromPR, Landing: *landing, Log: os.Stdout,
+		Check: *check, MergeOnFail: fold, Force: *force, SourcePR: *fromPR, Landing: *landing, Log: stdout,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("\nCreated stack %q (%d branches, %s landing). The top branch matches %s exactly.\n", s.Name, len(s.Branches), *landing, src)
+	fmt.Fprintf(stdout, "\nCreated stack %q (%d branches, %s landing). The top branch matches %s exactly.\n", s.Name, len(s.Branches), *landing, src)
 	for _, b := range s.Branches {
-		fmt.Printf("  %s\n", b.Name)
+		fmt.Fprintf(stdout, "  %s\n", b.Name)
 	}
-	fmt.Println("\nNext: stackq push   (then stackq land, or let CI take it from there)")
+	fmt.Fprintln(stdout, "\nNext: stackq push   (then stackq land, or let CI take it from there)")
 	return nil
 }
 
@@ -331,6 +345,59 @@ func withoutFlag(args []string, name string) []string {
 	return out
 }
 
+// summaryLines caps the log shown in the job summary; the full log is in the run.
+const summaryLines = 200
+
+// writeSummary appends what this run did to the GitHub Actions job summary
+// (the file in GITHUB_STEP_SUMMARY): the command, the event that started it,
+// the outcome and the log, so a run can be read without opening its log.
+func writeSummary(path, cmd string, args []string, event, log string, runErr error) error {
+	var b strings.Builder
+	title := strings.TrimSpace("stackq " + cmd + " " + strings.Join(args, " "))
+	fmt.Fprintf(&b, "### %s\n\n", strings.ReplaceAll(title, "\n", " "))
+	if event != "" {
+		fmt.Fprintf(&b, "Event: `%s`. ", event)
+	}
+	switch {
+	case runErr == nil:
+		b.WriteString("Result: ✓ done.\n\n")
+	case errors.Is(runErr, flag.ErrHelp):
+		b.WriteString("Result: printed the usage.\n\n")
+	default:
+		fmt.Fprintf(&b, "Result: ✗ failed.\n\n%s\n", fenced(runErr.Error()))
+	}
+	log = strings.TrimRight(log, "\n")
+	if log == "" {
+		b.WriteString("No output.\n")
+	} else {
+		lines := strings.Split(log, "\n")
+		if len(lines) > summaryLines {
+			fmt.Fprintf(&b, "Last %d of %d lines; the run's log has all of them.\n\n", summaryLines, len(lines))
+			lines = lines[len(lines)-summaryLines:]
+		}
+		b.WriteString(fenced(strings.Join(lines, "\n")))
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(b.String() + "\n"); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// fenced puts text in a code block whose fence is longer than any run of
+// backticks in it, so the text cannot end the block early.
+func fenced(text string) string {
+	fence := "```"
+	for strings.Contains(text, fence) {
+		fence += "`"
+	}
+	return fence + "\n" + text + "\n" + fence + "\n"
+}
+
 // PlanMarker starts the PR comment that previews a split, so the workflow
 // can update the comment instead of adding another one.
 const PlanMarker = "<!-- stackq:plan -->"
@@ -340,18 +407,13 @@ const PlanMarker = "<!-- stackq:plan -->"
 func planComment(src, base string, maxLines int, p *split.Plan) string {
 	var out bytes.Buffer
 	printPlan(&out, src, base, p)
-	text := out.String()
-	fence := "```"
-	for strings.Contains(text, fence) {
-		fence += "`"
-	}
 	budget := ""
 	if maxLines > 0 {
 		budget = fmt.Sprintf(" with a budget of %d changed lines per slice", maxLines)
 	}
-	return fmt.Sprintf("%s\n**stackq plan**: this PR would become %d stacked PRs%s.\n\n%s\n%s%s\n\n"+
+	return fmt.Sprintf("%s\n**stackq plan**: this PR would become %d stacked PRs%s.\n\n%s\n"+
 		"Add the `stackq:split` label to create the stack. The build check from `.stackq.json` runs only then, so a slice that fails it is folded into the next one and the stack can end up with fewer PRs. Add `stackq:plan` again after a push to refresh this preview.\n",
-		PlanMarker, len(p.Slices), budget, fence, text, fence)
+		PlanMarker, len(p.Slices), budget, fenced(strings.TrimRight(out.String(), "\n")))
 }
 
 func printPlan(w io.Writer, src, base string, p *split.Plan) {
@@ -408,15 +470,15 @@ func cmdList(args []string) error {
 		return err
 	}
 	if len(names) == 0 {
-		fmt.Println("no stacks")
+		fmt.Fprintln(stdout, "no stacks")
 	}
 	for _, n := range names {
 		s, err := stack.Load(r, n)
 		if err != nil {
-			fmt.Printf("%s (unreadable: %v)\n", n, err)
+			fmt.Fprintf(stdout, "%s (unreadable: %v)\n", n, err)
 			continue
 		}
-		fmt.Printf("%s  %d/%d landed  from %s\n", n, len(s.Branches)-len(s.Active()), len(s.Branches), s.Source)
+		fmt.Fprintf(stdout, "%s  %d/%d landed  from %s\n", n, len(s.Branches)-len(s.Active()), len(s.Branches), s.Source)
 	}
 	return nil
 }
@@ -436,14 +498,14 @@ func cmdStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Stack %s → %s (from %s)\n", s.Name, s.TrunkRef(r), s.Source)
+	fmt.Fprintf(stdout, "Stack %s → %s (from %s)\n", s.Name, s.TrunkRef(r), s.Source)
 	for i, b := range s.Branches {
 		pr := "  -  "
 		if b.PR > 0 {
 			pr = fmt.Sprintf("#%-4d", b.PR)
 		}
 		if b.Merged {
-			fmt.Printf("  %02d ✅ %s %s (landed)\n", i+1, pr, b.Name)
+			fmt.Fprintf(stdout, "  %02d ✅ %s %s (landed)\n", i+1, pr, b.Name)
 			continue
 		}
 		parent := b.Parent
@@ -458,7 +520,7 @@ func cmdStatus(args []string) error {
 		if sha, err := r.RevParse(b.Name); err == nil && b.PushedSHA != "" && sha != b.PushedSHA {
 			state += "  unpushed"
 		}
-		fmt.Printf("  %02d ⬜ %s %s (%d commits on %s)%s\n", i+1, pr, b.Name, n, b.Parent, state)
+		fmt.Fprintf(stdout, "  %02d ⬜ %s %s (%d commits on %s)%s\n", i+1, pr, b.Name, n, b.Parent, state)
 	}
 	return nil
 }
@@ -480,10 +542,10 @@ func cmdSync(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: !*noFetch, RebaseTrunk: *trunk, Log: os.Stdout}); err != nil {
+	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: !*noFetch, RebaseTrunk: *trunk, Log: stdout}); err != nil {
 		return err
 	}
-	fmt.Printf("Stack %s is in sync (%d of %d left to land).\n", s.Name, len(s.Active()), len(s.Branches))
+	fmt.Fprintf(stdout, "Stack %s is in sync (%d of %d left to land).\n", s.Name, len(s.Active()), len(s.Branches))
 	return nil
 }
 
@@ -506,9 +568,9 @@ func cmdPush(args []string) error {
 	if err != nil {
 		return err
 	}
-	return stack.Push(r, &forge.GH{Dir: r.Dir, Log: os.Stdout}, s, stack.PushOptions{
+	return stack.Push(r, &forge.GH{Dir: r.Dir, Log: stdout}, s, stack.PushOptions{
 		Draft: *draft, SourcePR: *fromPR, NoSourcePR: *noSource,
-		CloseSource: *closeSource || c.cfg.CloseSource, Log: os.Stdout,
+		CloseSource: *closeSource || c.cfg.CloseSource, Log: stdout,
 	})
 }
 
@@ -653,7 +715,7 @@ func cmdCI(args []string) error {
 			return err
 		}
 		if sub == "" {
-			fmt.Println("stackq: nothing to do for this event")
+			fmt.Fprintln(stdout, "stackq: nothing to do for this event")
 			return nil
 		}
 	}
@@ -795,12 +857,12 @@ func cmdDoctor(args []string) error {
 
 func runDoctor(r *git.Repo, c *common) error {
 	trunk := c.trunk(r, "")
-	fmt.Printf("stackq doctor (trunk %s)\n\n", trunk)
+	fmt.Fprintf(stdout, "stackq doctor (trunk %s)\n\n", trunk)
 	rs := doctor.Run(&forge.GH{Dir: r.Dir}, r.Dir, doctor.Config{
 		Trunk: trunk, Prefix: c.cfg.Prefix, Landing: c.cfg.Landing, AutoLand: c.cfg.AutoLand,
 		Priority: c.cfg.Priority != nil && c.cfg.Priority.Enabled,
 	})
-	if doctor.Print(os.Stdout, rs) {
+	if doctor.Print(stdout, rs) {
 		return errors.New("the setup has problems (✗ above)")
 	}
 	return nil
