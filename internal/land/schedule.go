@@ -109,7 +109,7 @@ func (c *Runner) Schedule(trunk string, dryRun bool) ([]prio.Decision, error) {
 		pr := byNum[d.PR.Number]
 		jump := d.Action == prio.Jump
 		err := c.Forge.Enqueue(pr, forge.EnqueueOptions{Jump: jump})
-		if err != nil && jump {
+		if err != nil && jump && !forge.IsPermanent(err) {
 			c.logf("! #%d could not jump (%v); queueing it normally", pr.Number, err)
 			jump = false
 			d.Note = "jump refused by GitHub; first in line instead"
