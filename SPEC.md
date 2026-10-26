@@ -503,7 +503,7 @@ Entry point: `stack.Create(repo, plan, CreateOptions) (*Stack, error)`.
 5. **Create branches.** `git branch --force <prefix>NN-<slug> <sha>`. Set the parent chain, with the first branch's `ParentTip` equal to the fork point and each later branch's equal to the previous commit. Save the JSON.
 
 Notes:
-- Untracked files produced by `--check` (build outputs) persist in the worktree across slices, but are never committed. See §24, issue K4.
+- Untracked files produced by `--check` (build outputs) persist in the worktree across slices, but are never committed. Set `cleanBetweenChecks` to remove them before each check (§24, K4).
 - Each slice is exactly **one commit**, which keeps restacks trivial. Users may add more commits during review; sync handles any number.
 
 ---
@@ -962,6 +962,7 @@ Exit codes: 0 for success, 1 for any error (message on stderr prefixed `stackq:`
 | `minApprovals` | int | 1 | Approvals each part needs before an atomic landing |
 | `allowUnreviewed` | bool | false | Skip the approval gate for atomic landings, from CI and `land`. Checks, requested changes and stacking are still enforced. For repos that cannot get a second reviewer (sandboxes); GitHub's own branch rules still apply |
 | `keepBranches` | bool | false | Keep part branches after an atomic landing |
+| `cleanBetweenChecks` | bool | false | Run `git clean -fdx` in the slice worktree before each `--check` (K4) |
 | `activationReminderDays` | int | 7 | Days a ready activation PR waits before stackq comments, and between comments. 0 or less turns reminders off (§28.7) |
 | `flags.paths` | `[]glob` | none | Flag definitions; land first (§29) |
 | `flags.activation` | `[]glob` | none | Files that turn features on; held in a hand-merged PR |
@@ -1048,7 +1049,7 @@ stateDiagram-v2
 
 ### What stackq enforces
 
-- **A PR body proves nothing.** Anyone can open a PR, from a fork of a public repo, with any body, including a copied stack marker with a higher index. Before this was enforced such a PR became the stack's lander and stackq retargeted and queued it. Every read of a marker goes through `Runner.markerOf`, which accepts a PR only if its head branch is in this repository (`isCrossRepository` is false) and is named like stackq names stack branches (the config `prefix`, `stack/{name}/` by default). The marker's values are then used only as a stack name and a branch name compared for equality, and a trunk name in refspecs and `gh pr edit --base`; every git call passes arguments as an argv array, never through a shell. *Open:* validate `marker.trunk` against the default branch (K5).
+- **A PR body proves nothing.** Anyone can open a PR, from a fork of a public repo, with any body, including a copied stack marker with a higher index. Before this was enforced such a PR became the stack's lander and stackq retargeted and queued it. Every read of a marker goes through `Runner.markerOf`, which accepts a PR only if its head branch is in this repository (`isCrossRepository` is false) and is named like stackq names stack branches (the config `prefix`, `stack/{name}/` by default). The marker's values are then used only as a stack name and a branch name compared for equality, and a trunk name in refspecs and `gh pr edit --base`; every git call passes arguments as an argv array, never through a shell. `marker.trunk` is validated against the repository's trunk in CI (K5, §24).
 - **The build check is untrusted code.** `check` comes from `.stackq.json` on the branch being split. Three layers keep the token from it:
   1. The Action gives `split` and `plan` no token at all; they make no GitHub calls. Removing the token from the check's own environment is not enough on its own: a process can read its parents' environment from `/proc/<pid>/environ`, so the token must never be in any ancestor of the check.
   2. The check also runs without `GH_TOKEN`, `GITHUB_TOKEN`, `STACKQ_TOKEN` or the Actions runtime/OIDC tokens in its environment, for when stackq is run another way.
@@ -1150,8 +1151,8 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
 - **K1. (Wording fixed 2026-10-16.)** The conflict comment now says sync stops and prints the exact rebase command. Still worth adding: a `stackq sync --interactive` that leaves the rebase in progress in the user's worktree, plus `stackq continue`.
 - **K2. (Done 2026-10-26, §14.5.)** Enqueue errors are classified by GitHub's wording: closed, draft, moved head, missing PR and a token without permission are final and skip the auto-merge fallback, which also keeps a moved head from being queued unchecked. Other errors still fall back.
 - **K3. Merged-PR history is capped at the 200 most recent.** Older merged stack PRs lose their ✅ in the nav. This is cosmetic. Fix it by fetching specific PR numbers recorded in the markers, or with a search query.
-- **K4. `--check` artifacts carry over.** Untracked artifacts from one slice's check persist into the next slice's check, which could mask failures (for example, generated code). Fix by running `git clean -fdx` (optional, configurable) before each check, or by running checks in a fresh worktree per slice.
-- **K5. The marker trunk is unvalidated in CI** (§22).
+- **K4. (Done 2026-10-26.)** Config `cleanBetweenChecks` (default off) runs `git clean -fdx` in the slice worktree before each `--check`, so build output from one slice's check cannot make the next slice's check pass. The slice's own files are staged, so they stay. Off by default because a check that installs dependencies into the tree would reinstall them for every slice.
+- **K5. (Done 2026-10-26.)** In CI the marker's trunk must equal the repository's trunk: the config `trunk`, else the default branch from the event payload, else the resolved trunk. `markerOf` ignores any other marker and logs it once per PR. Local runs set no trunk and are unchanged. A repo that stacks onto a branch other than its default must set `trunk` in `.stackq.json`.
 - **K11. Atomic mode on live GitHub: verified end to end** (8-part stack: split, push, CI, retarget of the lander, one queue entry, 7 rebased per-part commits on trunk, parts closed, branches deleted, activation PR left as an unmerged draft). Still unverified because the sandbox used `allowUnreviewed`: whether retargeting keeps existing approvals, and how CODEOWNERS review applies to the lander's full diff (§28.6).
 - **K13. Priority on live GitHub: the `mergeQueue` GraphQL shape and the pool pass are verified** (2026-10-25). Still unverified: `jump` permissions, and whether a pass triggered by Dependabot can read secrets (§31.7).
 - **K12. Revert relies on `refs/pull/N/head`** to find a PR's commits after its branch is deleted. GitHub keeps these refs, but forks and some mirrors don't.
@@ -1217,12 +1218,12 @@ Ordered by value to you.
 
 ### P1: robustness
 
-5. Validate the marker trunk in CI (K5). Add a `"v":1` field to the marker.
+5. ~~Validate the marker trunk in CI (K5)~~ (done). Add a `"v":1` field to the marker.
 6. Per-stack concurrency groups (K7).
 7. Classify enqueue errors (K2).
 8. Sync uses the forge for landing detection when available (G1, squash support).
 9. `stackq adopt` rebuilds local state from PRs (G4).
-10. Run `git clean -fdx` between checks, behind config `cleanBetweenChecks` (K4).
+10. ~~Run `git clean -fdx` between checks, behind config `cleanBetweenChecks` (K4)~~ (done).
 
 Also in P1, unnumbered:
 
@@ -1862,7 +1863,7 @@ The checks in §10 make each part buildable. Keep that property on trunk:
 
 - **Signed commits from CI** (P1.11).
 - **Least privilege:** the App needs only Contents and Pull requests write; revert pushes go only to `stackq/revert/**`.
-- **Validate the marker trunk** (K5), and make sure revert never targets anything but the trunk.
+- ~~Validate the marker trunk (K5)~~ (done: revert reads its trunk from a validated marker, so in CI it can only target the repository's trunk).
 
 ### 30.11 Observability
 

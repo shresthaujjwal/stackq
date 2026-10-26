@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"stackq/internal/plural"
 )
 
 // Match selects PRs for a class. Signal fields are OR'd: any one matching
@@ -175,7 +177,7 @@ func (m *Match) matches(p PR) (bool, string) {
 	}
 	if !m.hasSignals {
 		if m.MaxLines > 0 || m.MaxFiles > 0 {
-			return true, fmt.Sprintf("%d lines in %d files", p.Lines, p.Files)
+			return true, fmt.Sprintf("%s in %s", plural.N(p.Lines, "line"), plural.N(p.Files, "file"))
 		}
 		return true, "default"
 	}

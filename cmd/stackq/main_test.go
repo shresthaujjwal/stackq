@@ -141,7 +141,7 @@ func TestAnnotationReportsTheOutcomeOnOneEscapedLine(t *testing.T) {
 		{"done", "a\nb\n", nil, nil, []string{"tick"}, "::notice title=stackq ci tick::done; 2 lines of output, written to the job summary"},
 		{"quiet", "", nil, nil, nil, "::notice title=stackq ci::done; no output"},
 		{"failed", "x", errors.New("bad: 100%\nnext"), nil, nil, "::error title=stackq ci::failed: bad: 100%25%0Anext"},
-		{"summary", "x", nil, errors.New("disk"), nil, "::warning title=stackq ci::done; 1 lines of output, written to the job summary (the job summary could not be written: disk)"},
+		{"summary", "x", nil, errors.New("disk"), nil, "::warning title=stackq ci::done; 1 line of output, written to the job summary (the job summary could not be written: disk)"},
 	} {
 		if got := annotation("ci", c.args, c.log, c.runErr, c.summaryErr); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
@@ -149,5 +149,36 @@ func TestAnnotationReportsTheOutcomeOnOneEscapedLine(t *testing.T) {
 	}
 	if got := annotation("ci", []string{"--pr", "a,b"}, "x", nil, nil); !strings.Contains(got, "title=stackq ci --pr a%2Cb::") {
 		t.Errorf("title is not escaped: %q", got)
+	}
+}
+
+func TestPlanSaysOneFileAndOneStackedPR(t *testing.T) {
+	p := &split.Plan{Base: "0123456789abcdef", Slices: []split.Slice{
+		{Name: "api", Files: []git.Change{{Status: 'A', Path: "api/handler.go", Added: 5}}},
+	}}
+	got := planComment("feature/big", "origin/main", 0, p)
+	for _, want := range []string{"into 1 slice on", "this PR would become 1 stacked PR.", "  1 file  "} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan lacks %q:\n%s", want, got)
+		}
+	}
+	for _, bad := range []string{"1 slices", "1 files", "1 stacked PRs"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("plan contains %q:\n%s", bad, got)
+		}
+	}
+}
+
+func TestCITrunkPrefersTheConfigThenGitHubsDefaultBranch(t *testing.T) {
+	event(t, "workflow_dispatch", `{"repository":{"default_branch":"develop"}}`)
+	if got := ciTrunk("release", "main"); got != "release" {
+		t.Errorf("config first: %q", got)
+	}
+	if got := ciTrunk("", "main"); got != "develop" {
+		t.Errorf("event default branch next: %q", got)
+	}
+	event(t, "workflow_dispatch", `{}`)
+	if got := ciTrunk("", "main"); got != "main" {
+		t.Errorf("resolved trunk last: %q", got)
 	}
 }

@@ -42,7 +42,7 @@ func TestActivationPRIsRemindedAfterAWeekAndThenEveryWeek(t *testing.T) {
 		t.Fatal("no reminder after 8 days")
 	}
 	said := fx.f.Comments[held][len(fx.f.Comments[held])-1]
-	for _, want := range []string{"landed 8 days ago", "Stack `feat`", "stackq land --pr", "again in 7 days"} {
+	for _, want := range []string{"landed 8 days ago", "Stack `feat`", "stackq land --pr", "again in 7 days."} {
 		if !strings.Contains(said, want) {
 			t.Errorf("reminder lacks %q: %s", want, said)
 		}
@@ -74,5 +74,21 @@ func TestActivationRemindersCanBeSwitchedOff(t *testing.T) {
 	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", ReminderDays: 0}
 	if err := run.RemindActivations(); err != nil || len(fx.f.Comments[held]) != 0 {
 		t.Fatalf("reminders are off but got %v %v", err, fx.f.Comments[held])
+	}
+}
+
+func TestReminderSaysOneDayInTheSingular(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	held := fx.s.Branches[3].PR
+	fx.f.AddLabels(held, land.LabelActivation)
+	ready := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	fx.f.ReadyFor = map[forge.ReadyKey]time.Time{{PR: held, Label: land.LabelActivation}: ready}
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", ReminderDays: 1, Now: func() time.Time { return ready.Add(30 * time.Hour) }}
+	if err := run.RemindActivations(); err != nil {
+		t.Fatal(err)
+	}
+	said := strings.Join(fx.f.Comments[held], "\n")
+	if !strings.Contains(said, "landed 1 day ago") || !strings.Contains(said, "again in 1 day.") || strings.Contains(said, "1 days") {
+		t.Fatalf("want singular days, got %q", said)
 	}
 }

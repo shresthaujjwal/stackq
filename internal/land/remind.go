@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"stackq/internal/plural"
 )
 
 // DefaultReminderDays is how long a ready activation PR waits before stackq
@@ -55,9 +57,9 @@ func (c *Runner) RemindActivations() error {
 			continue
 		}
 		days := int(c.now().Sub(ready) / (24 * time.Hour))
-		if err := c.Forge.Comment(p.Number, fmt.Sprintf("⏰ Stack `%s` landed %d days ago and this activation PR is still waiting. "+
+		if err := c.Forge.Comment(p.Number, fmt.Sprintf("⏰ Stack `%s` landed %s ago and this activation PR is still waiting. "+
 			"Merge it (or run `stackq land --pr %d`) when you are ready to switch the feature on, or close it if it is no longer needed. "+
-			"stackq reminds again in %d days.", m.Stack, days, p.Number, c.ReminderDays)); err != nil {
+			"stackq reminds again in %s.", m.Stack, plural.N(days, "day"), p.Number, plural.N(c.ReminderDays, "day"))); err != nil {
 			errs = append(errs, fmt.Errorf("#%d: %w", p.Number, err))
 			continue
 		}
@@ -67,7 +69,7 @@ func (c *Runner) RemindActivations() error {
 			errs = append(errs, fmt.Errorf("#%d: %w", p.Number, err))
 			continue
 		}
-		c.logf("⏰ #%d (activation) has waited %d days; reminded", p.Number, days)
+		c.logf("⏰ #%d (activation) has waited %s; reminded", p.Number, plural.N(days, "day"))
 	}
 	return errors.Join(errs...)
 }

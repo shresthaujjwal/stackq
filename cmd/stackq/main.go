@@ -19,6 +19,7 @@ import (
 	"stackq/internal/forge"
 	"stackq/internal/git"
 	"stackq/internal/land"
+	"stackq/internal/plural"
 	"stackq/internal/prio"
 	"stackq/internal/split"
 	"stackq/internal/stack"
@@ -150,6 +151,9 @@ type config struct {
 	Landing      string `json:"landing"`
 	MinApprovals int    `json:"minApprovals"`
 	KeepBranches bool   `json:"keepBranches"`
+	// CleanBetweenChecks runs git clean -fdx in the slice worktree before each
+	// check, so build output from one slice cannot hide another's failure.
+	CleanBetweenChecks bool `json:"cleanBetweenChecks"`
 	// ActivationReminderDays: how long a ready activation PR waits before
 	// stackq comments, and between comments. Default 7; 0 or less turns it off.
 	ActivationReminderDays *int `json:"activationReminderDays"`
@@ -329,12 +333,12 @@ func cmdSplit(args []string, dry bool) error {
 	fmt.Fprintln(stdout)
 	s, err := stack.Create(r, plan, stack.CreateOptions{
 		Name: *name, Prefix: *prefix, Trunk: trunk, Remote: c.remote, Source: src,
-		Check: *check, MergeOnFail: fold, Force: *force, SourcePR: *fromPR, Landing: *landing, Log: stdout,
+		Check: *check, CleanBetweenChecks: c.cfg.CleanBetweenChecks, MergeOnFail: fold, Force: *force, SourcePR: *fromPR, Landing: *landing, Log: stdout,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "\nCreated stack %q (%d branches, %s landing). The top branch matches %s exactly.\n", s.Name, len(s.Branches), *landing, src)
+	fmt.Fprintf(stdout, "\nCreated stack %q (%s, %s landing). The top branch matches %s exactly.\n", s.Name, plural.N(len(s.Branches), "branch", "branches"), *landing, src)
 	for _, b := range s.Branches {
 		fmt.Fprintf(stdout, "  %s\n", b.Name)
 	}
@@ -407,7 +411,7 @@ func writeSummary(path, cmd string, args []string, event, log string, runErr err
 // are also in the API, so a run can be checked without opening the page.
 func annotation(cmd string, args []string, log string, runErr, summaryErr error) string {
 	title := strings.TrimSpace("stackq " + cmd + " " + strings.Join(args, " "))
-	level, msg := "notice", fmt.Sprintf("done; %d lines of output, written to the job summary", strings.Count(strings.TrimRight(log, "\n"), "\n")+1)
+	level, msg := "notice", fmt.Sprintf("done; %s of output, written to the job summary", plural.N(strings.Count(strings.TrimRight(log, "\n"), "\n")+1, "line"))
 	if strings.TrimSpace(log) == "" {
 		msg = "done; no output"
 	}
@@ -435,13 +439,6 @@ func fenced(text string) string {
 	return fence + "\n" + text + "\n" + fence + "\n"
 }
 
-func plural(n int, one, many string) string {
-	if n == 1 {
-		return one
-	}
-	return many
-}
-
 // PlanMarker starts the PR comment that previews a split, so the workflow
 // can update the comment instead of adding another one.
 const PlanMarker = "<!-- stackq:plan -->"
@@ -457,11 +454,11 @@ func planComment(src, base string, maxLines int, p *split.Plan) string {
 	}
 	return fmt.Sprintf("%s\n**stackq plan**: this PR would become %d stacked %s%s.\n\n%s\n"+
 		"Add the `stackq:split` label to create the stack. The build check from `.stackq.json` runs only then, so a slice that fails it is folded into the next one and the stack can end up with fewer PRs. Add `stackq:plan` again after a push to refresh this preview.\n",
-		PlanMarker, len(p.Slices), plural(len(p.Slices), "PR", "PRs"), budget, fenced(strings.TrimRight(out.String(), "\n")))
+		PlanMarker, len(p.Slices), plural.Word(len(p.Slices), "PR"), budget, fenced(strings.TrimRight(out.String(), "\n")))
 }
 
 func printPlan(w io.Writer, src, base string, p *split.Plan) {
-	fmt.Fprintf(w, "Split %s into %d slices on %s (fork point %s):\n", src, len(p.Slices), base, git.Short(p.Base))
+	fmt.Fprintf(w, "Split %s into %s on %s (fork point %s):\n", src, plural.N(len(p.Slices), "slice"), base, git.Short(p.Base))
 	for i, s := range p.Slices {
 		add, del := 0, 0
 		for _, f := range s.Files {
@@ -477,7 +474,7 @@ func printPlan(w io.Writer, src, base string, p *split.Plan) {
 		case s.Pinned:
 			pin = " [rule]"
 		}
-		fmt.Fprintf(w, "  %02d %-36s %3d files  +%d/-%d%s\n", i+1, s.Name, len(s.Files), add, del, pin)
+		fmt.Fprintf(w, "  %02d %-36s %3d %-5s +%d/-%d%s\n", i+1, s.Name, len(s.Files), plural.Word(len(s.Files), "file"), add, del, pin)
 		for j, f := range s.Files {
 			if j == 6 {
 				fmt.Fprintf(w, "       … and %d more\n", len(s.Files)-6)
@@ -564,7 +561,7 @@ func cmdStatus(args []string) error {
 		if sha, err := r.RevParse(b.Name); err == nil && b.PushedSHA != "" && sha != b.PushedSHA {
 			state += "  unpushed"
 		}
-		fmt.Fprintf(stdout, "  %02d ⬜ %s %s (%d commits on %s)%s\n", i+1, pr, b.Name, n, b.Parent, state)
+		fmt.Fprintf(stdout, "  %02d ⬜ %s %s (%s on %s)%s\n", i+1, pr, b.Name, plural.N(n, "commit"), b.Parent, state)
 	}
 	return nil
 }
@@ -767,7 +764,9 @@ func cmdCI(args []string) error {
 		return runDoctor(r, &c)
 	}
 	if sub == "gc" {
-		_, err := c.runner(r).GC(c.trunk(r, ""), true)
+		g := c.runner(r)
+		g.Trunk = ciTrunk(c.cfg.Trunk, c.trunk(r, ""))
+		_, err := g.GC(c.trunk(r, ""), true)
 		return err
 	}
 	if n == 0 && sub != "schedule" && sub != "tick" {
@@ -783,6 +782,9 @@ func cmdCI(args []string) error {
 	run := c.runner(r)
 	run.Enqueue = !*noEnqueue
 	trunk := c.trunk(r, "")
+	// In CI a PR body is untrusted: only a marker that names the repository's
+	// own trunk (the config's, else GitHub's default branch) is believed.
+	run.Trunk = ciTrunk(c.cfg.Trunk, trunk)
 	// A merge or an ejection frees a queue slot: refill it.
 	afterwards := func(err error) error {
 		if run.Prio == nil || !run.Prio.Enabled {
@@ -821,6 +823,27 @@ func cmdCI(args []string) error {
 		return err
 	}
 	return fmt.Errorf("unknown ci command %q (after-merge, dequeued, land, revert, schedule, tick)", sub)
+}
+
+// ciTrunk is the trunk CI trusts stack markers to name: the config's, else the
+// repository's default branch from the event payload, else resolved.
+func ciTrunk(configured, resolved string) string {
+	if configured != "" {
+		return configured
+	}
+	if p := os.Getenv("GITHUB_EVENT_PATH"); p != "" {
+		if data, err := os.ReadFile(p); err == nil {
+			var ev struct {
+				Repository struct {
+					DefaultBranch string `json:"default_branch"`
+				} `json:"repository"`
+			}
+			if json.Unmarshal(data, &ev) == nil && ev.Repository.DefaultBranch != "" {
+				return ev.Repository.DefaultBranch
+			}
+		}
+	}
+	return resolved
 }
 
 // fromEvent maps the GitHub Actions event to a ci command.
