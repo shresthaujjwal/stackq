@@ -35,6 +35,9 @@ const (
 	LabelActivation = "stackq:activation"
 	LabelIntegrity  = "stackq:integrity"
 	LabelRevert     = "stackq:revert"
+	// LabelReminded marks an activation PR that was reminded about; the time
+	// it was added is when to remind next.
+	LabelReminded = "stackq:reminded"
 )
 
 type Runner struct {
@@ -51,8 +54,11 @@ type Runner struct {
 	Prio *prio.Config
 	// Prefix is the branch prefix of stack branches, "stack/{name}/" by default.
 	Prefix string
-	Now    func() time.Time
-	Log    io.Writer
+	// ReminderDays is how long a ready activation PR waits before stackq
+	// comments, and between comments. 0 turns the reminders off.
+	ReminderDays int
+	Now          func() time.Time
+	Log          io.Writer
 }
 
 // markerOf returns the stack marker of p only if p can really be part of a

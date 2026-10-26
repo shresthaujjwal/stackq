@@ -150,6 +150,9 @@ type config struct {
 	Landing      string `json:"landing"`
 	MinApprovals int    `json:"minApprovals"`
 	KeepBranches bool   `json:"keepBranches"`
+	// ActivationReminderDays: how long a ready activation PR waits before
+	// stackq comments, and between comments. Default 7; 0 or less turns it off.
+	ActivationReminderDays *int `json:"activationReminderDays"`
 	// AutoLand lands an atomic stack by itself once every part is approved and
 	// green (checked on reviews, finished CI runs and the timer).
 	AutoLand bool `json:"autoLand"`
@@ -160,9 +163,17 @@ type config struct {
 	Priority        *prio.Config `json:"priority"`
 }
 
+func (c *common) reminderDays() int {
+	if c.cfg.ActivationReminderDays != nil {
+		return max(*c.cfg.ActivationReminderDays, 0)
+	}
+	return land.DefaultReminderDays
+}
+
 func (c *common) runner(r *git.Repo) *land.Runner {
 	return &land.Runner{Repo: r, Forge: &forge.GH{Dir: r.Dir, Log: stdout}, Remote: c.remote, Log: stdout,
-		Prefix: c.cfg.Prefix, MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority}
+		Prefix: c.cfg.Prefix, MinApprovals: c.cfg.MinApprovals, AllowUnreviewed: c.cfg.AllowUnreviewed, KeepBranches: c.cfg.KeepBranches, Prio: c.cfg.Priority,
+		ReminderDays: c.reminderDays()}
 }
 
 type common struct {
@@ -798,7 +809,7 @@ func cmdCI(args []string) error {
 				err = errors.Join(err, serr)
 			}
 		}
-		return err
+		return errors.Join(err, run.RemindActivations())
 	case "after-merge":
 		return afterwards(run.AfterMerge(n))
 	case "dequeued":

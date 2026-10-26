@@ -635,7 +635,7 @@ func (g *GH) Comment(n int, body string) error {
 var labelColors = map[string]string{
 	"stackq:conflict": "d73a4a", "stackq:blocked": "fbca04", "stackq:integrity": "b60205",
 	"stackq:landing": "0e8a16", "stackq:activation": "5319e7",
-	"stackq:queue": "c5def5", "stackq:jumped": "e99695", "stackq:revert": "d93f0b",
+	"stackq:queue": "c5def5", "stackq:reminded": "fef2c0", "stackq:jumped": "e99695", "stackq:revert": "d93f0b",
 }
 
 func (g *GH) AddLabels(n int, labels ...string) error {
