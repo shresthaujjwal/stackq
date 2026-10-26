@@ -25,6 +25,8 @@ type Fake struct {
 	MQ []QueueEntry
 	// Jumped records PRs enqueued with Jump.
 	Jumped []int
+	// ReviewRequests is who RequestReviews was asked to ask, per PR.
+	ReviewRequests map[int][]string
 	// Ready overrides ReadyAt per PR; default is the PR's CreatedAt.
 	Ready map[int]time.Time
 	// ReadyFor overrides ReadyAt for one PR and label.
@@ -257,6 +259,17 @@ func (f *Fake) AddLabels(n int, labels ...string) error {
 	for _, l := range labels {
 		f.Labels[n][l] = true
 	}
+	return nil
+}
+
+// ReviewRequests records who was asked to review each PR.
+func (f *Fake) RequestReviews(n int, users []string) map[string]error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ReviewRequests == nil {
+		f.ReviewRequests = map[int][]string{}
+	}
+	f.ReviewRequests[n] = append(f.ReviewRequests[n], users...)
 	return nil
 }
 

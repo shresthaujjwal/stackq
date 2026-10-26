@@ -206,6 +206,10 @@ Patterns follow gitignore semantics:
 
 The held activation PR is never merged by stackq. If it waits longer than `activationReminderDays` (default 7) it gets a comment saying how long it has been ready and how to merge it (`stackq land --pr N`) or close it, and again every `activationReminderDays` after that. `stackq:reminded` is the label that times this. Set `"activationReminderDays": 0` in `.stackq.json` to turn it off. Reminders are sent by ticks, so they need `autoLand` or the priority pool to be on and can come late, never early.
 
+## Reviews on the lander
+
+The PR that merges the stack (the lander) is a PR of its own, so approvals given on the lower parts are on other PRs. If your rules need approval on the merging PR, or approval by code owners, GitHub may keep the lander out of the queue. In that case (the lander's status says "Waiting for GitHub's requirements") stackq asks the people who approved the lower parts to review the lander, and says who it asked. It does not read CODEOWNERS and does not change when a stack lands. This has been tested against a fake GitHub only; try it on a throwaway stack with a second reviewer first.
+
 ## Which trunk CI trusts
 
 A PR body can be written by anyone who can open a PR, and a stack's marker in it names a trunk. In CI stackq acts only on markers that name the repository's trunk: `trunk` in `.stackq.json`, else GitHub's default branch. Any other marker is ignored and noted in the run's log. If your stacks target a branch other than the default, set `trunk` in `.stackq.json`.

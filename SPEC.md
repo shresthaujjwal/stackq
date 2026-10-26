@@ -1701,7 +1701,7 @@ In CI this is available as `stackq ci revert --pr N` and as the workflow_dispatc
 ### 28.6 Caveats (K11; checks on stacked PRs verified live, the rest still to verify)
 
 - **CODEOWNERS on the lander.** Once retargeted, the lander's diff covers every file in the stack, and required code-owner reviews are evaluated on that diff. Owners who approved a lower part may need to approve the lander too. Options:
-  1. request their review automatically at land time (planned),
+  1. request their review at land time. **Done in part (2026-10-26):** when GitHub would not queue the lander (auto-merge is waiting for the PR's requirements, so `landingState` is `auto-merge`), stackq asks the users who approved the lower parts, and have not approved the lander, to review it (`RequestReviews`), and says so in the status section. This asks people, not CODEOWNERS entries: stackq does not parse the CODEOWNERS file, so an owner who never reviewed a part is not asked here (GitHub's own owner request on the PR still applies). It changes no gate and does nothing under `allowUnreviewed`. **Not tested on GitHub:** the sandbox has one user, so a real run needs a repo with a second reviewer and a code-owner rule,
   2. align parts with owners (§30.5), so each owner approves one part and then the lander,
   3. give the stackq App a ruleset bypass. Discouraged.
 - **Approval retention.** Retargeting is not a push, so "dismiss stale approvals on push" should not fire. Confirm this. Restacks *are* pushes and can dismiss approvals.
