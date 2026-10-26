@@ -90,6 +90,9 @@ type Forge interface {
 	Comment(n int, body string) error
 	ClosePR(n int) error
 	AddLabels(n int, labels ...string) error
+	// RequestReviews asks the given users to review PR n. It returns the
+	// users GitHub refused (for example the PR's author), with the reason.
+	RequestReviews(n int, users []string) (refused map[string]error)
 	RemoveLabels(n int, labels ...string) error
 }
 
@@ -650,6 +653,18 @@ func (g *GH) AddLabels(n int, labels ...string) error {
 		}
 	}
 	return nil
+}
+
+func (g *GH) RequestReviews(n int, users []string) map[string]error {
+	refused := map[string]error{}
+	for _, u := range users {
+		// One call per user, so a refusal (the author cannot review their own
+		// PR) does not stop the others being asked.
+		if _, err := g.run("", "api", "-X", "POST", fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/requested_reviewers", n), "-f", "reviewers[]="+u); err != nil {
+			refused[u] = err
+		}
+	}
+	return refused
 }
 
 func (g *GH) RemoveLabels(n int, labels ...string) error {

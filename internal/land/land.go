@@ -484,7 +484,7 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 		case stateQueued:
 			c.setStatus(lander, statusLanding(len(parts)))
 		case stateAutoMerge:
-			c.setStatus(lander, statusAutoMerge(len(parts)))
+			c.setStatus(lander, statusAutoMerge(len(parts))+c.askForLanderReview(lander, parts))
 		}
 		c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
 		return nil
