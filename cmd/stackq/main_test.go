@@ -128,3 +128,26 @@ func TestWriteSummaryAppendsTheOutcomeAndTheLog(t *testing.T) {
 		t.Errorf("summary keeps lines beyond the cap:\n%s", got)
 	}
 }
+
+func TestAnnotationReportsTheOutcomeOnOneEscapedLine(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		log        string
+		runErr     error
+		summaryErr error
+		args       []string
+		want       string
+	}{
+		{"done", "a\nb\n", nil, nil, []string{"tick"}, "::notice title=stackq ci tick::done; 2 lines of output, written to the job summary"},
+		{"quiet", "", nil, nil, nil, "::notice title=stackq ci::done; no output"},
+		{"failed", "x", errors.New("bad: 100%\nnext"), nil, nil, "::error title=stackq ci::failed: bad: 100%25%0Anext"},
+		{"summary", "x", nil, errors.New("disk"), nil, "::warning title=stackq ci::done; 1 lines of output, written to the job summary (the job summary could not be written: disk)"},
+	} {
+		if got := annotation("ci", c.args, c.log, c.runErr, c.summaryErr); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+	if got := annotation("ci", []string{"--pr", "a,b"}, "x", nil, nil); !strings.Contains(got, "title=stackq ci --pr a%2Cb::") {
+		t.Errorf("title is not escaped: %q", got)
+	}
+}

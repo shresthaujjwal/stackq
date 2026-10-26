@@ -204,7 +204,7 @@ Patterns follow gitignore semantics:
 
 ## Reading a run
 
-Each stackq run writes a short summary on its run page in the Actions tab: the command, the event that started it, whether it worked, and what it did (the last 200 lines; the full log is in the job). Open the newest `stackq` run to see why a stack is or is not moving.
+Each stackq run writes a short summary on its run page in the Actions tab: the command, the event that started it, whether it worked, and what it did (the last 200 lines; the full log is in the job). Open the newest `stackq` run to see why a stack is or is not moving. The run also carries a one-line annotation (done, or the error), which shows on the PR's checks too.
 
 ## Checking the setup
 
