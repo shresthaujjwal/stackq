@@ -139,7 +139,7 @@ If the big branch already has an open PR, `stackq push` finds it (or pass `--fro
    - **Ties** go to contracts (proto, schema, types), then libraries, entrypoints, infra, and docs.
 4. **Packing.** Groups are packed into slices up to `--max-lines` (default 400 changed lines).
 5. **Rules.** `slices` rules in `.stackq.json` pin files into named slices that keep their order.
-6. **Check.** `--check` runs a command, such as a build, in a throwaway worktree for each slice. If a slice fails, it is folded into the next one, so every branch in the stack builds.
+6. **Check.** `--check` runs a command, such as a build, in a throwaway worktree for each slice. If a slice fails, it is folded into the next one, so every branch in the stack builds. Build output from one slice's check stays in that worktree and can make the next slice's check pass; set `"cleanBetweenChecks": true` in `.stackq.json` to run `git clean -fdx` before each check.
 7. **Verification.** stackq verifies that the top of the stack is byte-for-byte the original branch. Your working tree is never touched.
 
 ## GitHub setup
@@ -205,6 +205,10 @@ Patterns follow gitignore semantics:
 ## Activation PRs that wait
 
 The held activation PR is never merged by stackq. If it waits longer than `activationReminderDays` (default 7) it gets a comment saying how long it has been ready and how to merge it (`stackq land --pr N`) or close it, and again every `activationReminderDays` after that. `stackq:reminded` is the label that times this. Set `"activationReminderDays": 0` in `.stackq.json` to turn it off. Reminders are sent by ticks, so they need `autoLand` or the priority pool to be on and can come late, never early.
+
+## Which trunk CI trusts
+
+A PR body can be written by anyone who can open a PR, and a stack's marker in it names a trunk. In CI stackq acts only on markers that name the repository's trunk: `trunk` in `.stackq.json`, else GitHub's default branch. Any other marker is ignored and noted in the run's log. If your stacks target a branch other than the default, set `trunk` in `.stackq.json`.
 
 ## Reading a run
 

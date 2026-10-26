@@ -24,6 +24,7 @@ import (
 
 	"stackq/internal/forge"
 	"stackq/internal/git"
+	"stackq/internal/plural"
 	"stackq/internal/prio"
 	"stackq/internal/stack"
 )
@@ -57,8 +58,14 @@ type Runner struct {
 	// ReminderDays is how long a ready activation PR waits before stackq
 	// comments, and between comments. 0 turns the reminders off.
 	ReminderDays int
-	Now          func() time.Time
-	Log          io.Writer
+	// Trunk, when set, is the only trunk a stack marker may name. A PR body is
+	// written by whoever opens the PR, and the marker's trunk ends up in
+	// refspecs and as the base of PRs stackq edits, so CI sets it to the
+	// repository's trunk and ignores a marker that names any other branch (K5).
+	Trunk   string
+	Now     func() time.Time
+	ignored map[int]bool
+	Log     io.Writer
 }
 
 // markerOf returns the stack marker of p only if p can really be part of a
@@ -70,6 +77,16 @@ type Runner struct {
 func (c *Runner) markerOf(p forge.PR) (stack.Marker, bool) {
 	m, ok := stack.ParseMarker(p.Body)
 	if !ok || p.CrossRepo || !strings.HasPrefix(p.HeadRef, c.branchPrefix(m.Stack)) {
+		return stack.Marker{}, false
+	}
+	if c.Trunk != "" && m.Trunk != c.Trunk {
+		if !c.ignored[p.Number] {
+			if c.ignored == nil {
+				c.ignored = map[int]bool{}
+			}
+			c.ignored[p.Number] = true
+			c.logf("! #%d names trunk %q in its stack marker, but this repository's trunk is %q; ignoring it", p.Number, m.Trunk, c.Trunk)
+		}
 		return stack.Marker{}, false
 	}
 	return m, true
@@ -393,7 +410,7 @@ func statusWaiting(problems []string) string {
 }
 
 func statusLanding(parts int) string {
-	return fmt.Sprintf("🚀 **Landing.** This PR carries all %d parts into the merge queue as one entry.", parts)
+	return fmt.Sprintf("🚀 **Landing.** This PR carries all %s into the merge queue as one entry.", plural.N(parts, "part"))
 }
 
 // statusAutoMerge is for a lander GitHub would not queue yet: auto-merge is on
@@ -401,12 +418,12 @@ func statusLanding(parts int) string {
 // that is usually a required check that only the PR's own pull_request run can
 // satisfy, and that run is held for approval.
 func statusAutoMerge(parts int) string {
-	return fmt.Sprintf("⏳ **Waiting for GitHub's requirements.** This PR carries all %d parts. GitHub would not put it in the merge queue yet, so auto-merge is on and queues it once the PR itself meets them: required checks passed, reviews given. "+
-		"If CI shows \"awaiting approval\" on this PR, approve that run. A required check is only met by CI that a pull request or the queue started, not by the CI stackq starts with the built-in token (see the README).", parts)
+	return fmt.Sprintf("⏳ **Waiting for GitHub's requirements.** This PR carries all %s. GitHub would not put it in the merge queue yet, so auto-merge is on and queues it once the PR itself meets them: required checks passed, reviews given. "+
+		"If CI shows \"awaiting approval\" on this PR, approve that run. A required check is only met by CI that a pull request or the queue started, not by the CI stackq starts with the built-in token (see the README).", plural.N(parts, "part"))
 }
 
 func statusPool(parts int) string {
-	return fmt.Sprintf("⧗ **Waiting in the priority pool** for a merge-queue slot. This PR carries all %d parts.", parts)
+	return fmt.Sprintf("⧗ **Waiting in the priority pool** for a merge-queue slot. This PR carries all %s.", plural.N(parts, "part"))
 }
 
 // attemptAtomic gates and queues an atomic stack. With auto set it is quiet:
@@ -548,7 +565,7 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 			return err
 		}
 		lander.BaseRef = m.Trunk
-		c.logf("~ #%d now targets %s and carries all %d parts", lander.Number, m.Trunk, len(parts))
+		c.logf("~ #%d now targets %s and carries all %s", lander.Number, m.Trunk, plural.N(len(parts), "part"))
 	}
 	head, err := c.Repo.RevParse(c.remoteRef(lander.HeadRef))
 	if err != nil {
@@ -557,8 +574,8 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 	lander.HeadSHA = head
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "🚀 **Landing stack `%s` atomically.** This PR now targets `%s` and carries all %d parts as a single merge-queue entry. "+
-		"Trunk gets either the whole stack or none of it.\n\n| Part | PR | Approved by | Checks |\n|---|---|---|---|\n", m.Stack, m.Trunk, len(parts))
+	fmt.Fprintf(&b, "🚀 **Landing stack `%s` atomically.** This PR now targets `%s` and carries all %s as a single merge-queue entry. "+
+		"Trunk gets either the whole stack or none of it.\n\n| Part | PR | Approved by | Checks |\n|---|---|---|---|\n", m.Stack, m.Trunk, plural.N(len(parts), "part"))
 	for _, r := range rows {
 		fmt.Fprintf(&b, "| %d | #%d | %s | %s |\n", sp.marks[r.pr.Number].Index, r.pr.Number, r.approvers, r.checks)
 	}
@@ -573,10 +590,10 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 		return err
 	}
 	if queued {
-		c.logf("⇢ #%d carries the whole stack (%d parts) into the queue", lander.Number, len(parts))
+		c.logf("⇢ #%d carries the whole stack (%s) into the queue", lander.Number, plural.N(len(parts), "part"))
 		c.setStatus(lander, statusLanding(len(parts)))
 	} else {
-		c.logf("⧗ #%d carries the whole stack (%d parts) and stays in the priority pool until a pass queues it", lander.Number, len(parts))
+		c.logf("⧗ #%d carries the whole stack (%s) and stays in the priority pool until a pass queues it", lander.Number, plural.N(len(parts), "part"))
 		c.setStatus(lander, statusPool(len(parts)))
 	}
 	return nil
@@ -837,7 +854,7 @@ func (c *Runner) finishAtomic(sp *stackPRs, lander forge.PR, m stack.Marker, chi
 		return err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "✅ **Stack `%s` landed atomically** on `%s`: %d parts in one merge-queue entry.\n\n", m.Stack, m.Trunk, len(parts)+1)
+	fmt.Fprintf(&b, "✅ **Stack `%s` landed atomically** on `%s`: %s in one merge-queue entry.\n\n", m.Stack, m.Trunk, plural.N(len(parts)+1, "part"))
 	if d.MergeCommit != "" {
 		fmt.Fprintf(&b, "Trunk commit: `%s`\n\n", git.Short(d.MergeCommit))
 	}

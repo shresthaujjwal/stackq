@@ -23,8 +23,13 @@ type CreateOptions struct {
 	// that fails is folded into the next one when MergeOnFail is set.
 	Check       string
 	MergeOnFail bool
-	Force       bool
-	Log         io.Writer
+	// CleanBetweenChecks removes untracked and ignored files (git clean -fdx)
+	// from the slice worktree before each check, so build output from one
+	// slice's check cannot make the next slice's check pass (K4). The slice's
+	// own files are staged, so they stay.
+	CleanBetweenChecks bool
+	Force              bool
+	Log                io.Writer
 }
 
 // Create builds one commit per slice in a temporary worktree (your working
@@ -72,6 +77,11 @@ func Create(r *git.Repo, p *split.Plan, o CreateOptions) (*Stack, error) {
 		pending = append(pending, sl.Name)
 		last := i == len(p.Slices)-1
 		if o.Check != "" {
+			if o.CleanBetweenChecks {
+				if _, err := w.Run("clean", "-fdx", "--quiet"); err != nil {
+					return nil, fmt.Errorf("cleaning before the check of slice %s: %w", sl.Name, err)
+				}
+			}
 			out, err := runCheck(w.Dir, o.Check)
 			switch {
 			case err == nil:

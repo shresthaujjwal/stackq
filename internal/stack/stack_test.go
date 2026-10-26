@@ -380,3 +380,37 @@ func TestCreateMovedPackageEveryBranchBuilds(t *testing.T) {
 		t.Fatal("top of stack differs from feature")
 	}
 }
+
+func TestCleanBetweenChecksStopsOneSlicesBuildOutputHidingAnotherSlicesFailure(t *testing.T) {
+	// The check passes only if no earlier check left .artifact behind: the
+	// stand-in for build output that makes a later slice look fine.
+	const check = "test ! -e .artifact && touch .artifact"
+	build := func(clean bool) (*stack.Stack, string) {
+		r := testrepo.GoApp(t)
+		p, err := split.Make(r, split.Options{Base: "main", Head: "feature", MaxLines: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var log bytes.Buffer
+		s, err := stack.Create(r, p, stack.CreateOptions{
+			Name: "feat", Prefix: "stack/feat/", Trunk: "main", Source: "feature",
+			Check: check, MergeOnFail: true, CleanBetweenChecks: clean, Log: &log,
+		})
+		if err != nil {
+			t.Fatalf("%v\n%s", err, log.String())
+		}
+		if !r.TreesEqual(s.Branches[len(s.Branches)-1].Name, "feature") {
+			t.Fatal("top of stack differs from feature")
+		}
+		return s, log.String()
+	}
+
+	_, dirty := build(false)
+	if !strings.Contains(dirty, "folding") {
+		t.Fatalf("without cleaning, the leftover file should make later checks fail and fold:\n%s", dirty)
+	}
+	s, clean := build(true)
+	if strings.Contains(clean, "✗") || len(s.Branches) != 6 {
+		t.Fatalf("with cleaning every slice should pass its check on its own (%d branches):\n%s", len(s.Branches), clean)
+	}
+}
