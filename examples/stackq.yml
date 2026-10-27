@@ -3,13 +3,15 @@
 #
 # Token: add a STACKQ_TOKEN secret (fine-grained PAT, or a GitHub App token you
 # mint with actions/create-github-app-token) at the repo or org level. Pushes
-# made with it trigger your CI, and an App can jump the queue. Without one
-# this uses the built-in token, and the last step starts CI on stack branches.
+# made with it trigger your CI. Without one this uses the built-in token, and
+# the last step starts CI on stack branches. Either way stackq links each stack
+# as a GitHub stack and lands it with GitHub's merge of the stack.
 name: stackq
 
 on:
   pull_request:
-    # closed+merged: restack / finish an atomic landing, then refill the queue
+    # closed+merged: finish what landed (GitHub restacks the rest), land the
+    #                next part of an incremental stack, refill the queue
     # dequeued:      the queue kicked a PR out; pause it and say why
     # labeled:       a PR joined the priority pool (stackq:queue)
     types: [closed, dequeued, labeled]

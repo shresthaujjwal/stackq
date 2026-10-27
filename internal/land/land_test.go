@@ -76,189 +76,336 @@ func (fx *fixture) mainTip(t *testing.T) string {
 	return testrepo.Must(t, fx.bare, "rev-parse", "refs/heads/main")
 }
 
-// queueLands simulates the merge queue merging PR n with method
-// (rebase, merge or squash), deleting its branch, and recording the merge
-// commit, then runs the CI handler in a fresh clone.
-func (fx *fixture) queueLands(t *testing.T, n int, method string) error {
-	t.Helper()
-	fx.mergeWithoutHandler(t, n, method)
-	run := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
-	return run.AfterMerge(n)
-}
-
-// mergeWithoutHandler is queueLands without the CI handler: the merge happened
-// but no "closed and merged" workflow ran, as when the merge is made on behalf
-// of the built-in GITHUB_TOKEN.
-func (fx *fixture) mergeWithoutHandler(t *testing.T, n int, method string) {
+// landQueue does what GitHub's merge queue does with the entries a merge
+// request put there: it lands each queued PR on trunk, bottom first, with
+// method (rebase, merge or squash) and records its merge commit. Each PR adds
+// only its own commits, the ones after the PR below it, as when GitHub merges
+// a stack. The fake then marks them merged and retargets the PRs above.
+func (fx *fixture) landQueue(t *testing.T, method string) []int {
 	t.Helper()
 	fx.publishPullRefs(t)
-	pr, _ := fx.f.GetPR(n)
-	ci := testrepo.Clone(t, fx.bare)
-	base := testrepo.Must(t, ci, "merge-base", "origin/main", "origin/"+pr.HeadRef)
-	fx.f.MarkMerged(n)
-	switch method {
-	case "rebase":
-		testrepo.RebaseMerge(t, fx.bare, base, pr.HeadRef, true)
-	case "merge":
-		testrepo.MergeCommitMerge(t, fx.bare, pr.HeadRef, true)
-	case "squash":
-		testrepo.SquashMerge(t, fx.bare, pr.HeadRef, true)
+	queued := append([]forge.QueueEntry(nil), fx.f.MQ...)
+	heads := map[string]string{} // branch -> head it merged with, in this pass
+	for _, e := range queued {
+		pr, _ := fx.f.GetPR(e.PR)
+		ci := testrepo.Clone(t, fx.bare)
+		head := testrepo.Must(t, ci, "rev-parse", "origin/"+pr.HeadRef)
+		// The PR's own commits start after the part below it, whether that
+		// merged in this pass or an earlier one.
+		from := ""
+		for i, b := range fx.s.Branches {
+			if b.PR == pr.Number && i > 0 {
+				below := fx.s.Branches[i-1]
+				if h, ok := heads[below.Name]; ok {
+					from = h
+				} else if bp, _ := fx.f.GetPR(below.PR); bp.Merged() {
+					from = bp.HeadSHA
+				}
+			}
+		}
+		if from == "" || !ci.IsAncestor(from, head) {
+			from = testrepo.Must(t, ci, "merge-base", "origin/main", head)
+		}
+		heads[pr.HeadRef] = head
+		switch method {
+		case "rebase":
+			testrepo.RebaseMerge(t, fx.bare, from, pr.HeadRef, false)
+		case "merge":
+			testrepo.MergeCommitMerge(t, fx.bare, pr.HeadRef, false)
+		case "squash":
+			testrepo.SquashMerge(t, fx.bare, pr.HeadRef, false)
+		}
+		tip := fx.mainTip(t)
+		fx.f.SetDetails(e.PR, func(d *forge.Details) { d.MergeCommit = tip })
 	}
-	tip := fx.mainTip(t)
-	fx.f.SetDetails(n, func(d *forge.Details) { d.MergeCommit = tip })
+	return fx.f.LandQueue()
 }
 
-// queueMerges simulates the merge queue landing PR i (0-based) with the
-// rebase method and auto-deleting its branch, then runs the CI handler in a
-// fresh clone, exactly as the workflow would.
-func (fx *fixture) queueMerges(t *testing.T, i int) error {
+// ci is a Runner in a fresh clone, as a workflow run would have.
+func (fx *fixture) ci(t *testing.T) *land.Runner {
+	return &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
+}
+
+func prBy(t *testing.T, fx *fixture, i int) forge.PR {
 	t.Helper()
-	b := fx.s.Branches[i]
-	pr, _ := fx.f.GetPR(b.PR)
-	// the PR targets trunk by now, so its own commits are trunk-base..head
-	ci := testrepo.Clone(t, fx.bare)
-	base := testrepo.Must(t, ci, "merge-base", "origin/main", "origin/"+b.Name)
-	fx.f.MarkMerged(pr.Number) // freezes HeadSHA before the branch is deleted
-	testrepo.RebaseMerge(t, fx.bare, base, b.Name, true)
-	run := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
-	return run.AfterMerge(pr.Number)
+	pr, err := fx.f.GetPR(fx.s.Branches[i].PR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pr
 }
 
-func TestStackLandsOneByOneThroughQueue(t *testing.T) {
-	fx := setup(t)
-	n := len(fx.s.Branches)
+func comments(fx *fixture, n int) string { return strings.Join(fx.f.Comments[n], "\n---\n") }
 
+func TestPushLinksTheStackOnGitHub(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	st, _ := fx.f.StackOf(prBy(t, fx, 0).Number)
+	prs, _ := fx.f.StackPRs(st)
+	if st == 0 || len(prs) != 4 || prs[3] != prBy(t, fx, 3).Number {
+		t.Fatalf("all four PRs, activation on top, should be one GitHub stack: %d %v", st, prs)
+	}
+}
+
+func TestAtomicStackLandsWithOneMergeRequestAndActivationWaits(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	orig, _ := fx.f.CreatePR("feature", "main", "New checkout", "desc", false)
+	if err := stack.Push(fx.dev, fx.f, fx.s, stack.PushOptions{SourcePR: orig.Number}); err != nil {
+		t.Fatal(err)
+	}
+	// flags, internal/checkout, cmd/shop, activation (held)
+	if n := len(fx.s.Branches); n != 4 || !fx.s.Branches[3].Hold {
+		t.Fatalf("unexpected stack: %+v", fx.s.Branches)
+	}
+	lander, hold := prBy(t, fx, 2), prBy(t, fx, 3)
 	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-	if err := run.Land(fx.s.Branches[1].PR); err == nil {
-		t.Fatal("landing a PR that targets another branch must fail")
+
+	// Gate: part 2 is not approved yet.
+	fx.f.SetDetails(prBy(t, fx, 1).Number, func(d *forge.Details) { d.Approvals = nil })
+	err := run.Land(prBy(t, fx, 0).Number)
+	if err == nil || !strings.Contains(err.Error(), "required approvals") || len(fx.f.Merges) != 0 {
+		t.Fatalf("unapproved part must block landing: %v %v", err, fx.f.Merges)
 	}
-	if err := run.Land(fx.s.Branches[0].PR); err != nil {
+	if !fx.f.Labels[lander.Number][land.LabelBlocked] {
+		t.Fatal("blocked label missing on the lander")
+	}
+	fx.f.SetDetails(prBy(t, fx, 1).Number, func(d *forge.Details) { d.Approvals = []string{"ana"} })
+
+	before := fx.mainTip(t)
+	if err := run.Land(prBy(t, fx, 0).Number); err != nil {
 		t.Fatal(err)
 	}
+	// One request, for the top part; GitHub queues the three parts in order.
+	if len(fx.f.Merges) != 1 || fx.f.Merges[0] != lander.Number {
+		t.Fatalf("want one merge request for the lander #%d, got %v", lander.Number, fx.f.Merges)
+	}
+	want := []int{prBy(t, fx, 0).Number, prBy(t, fx, 1).Number, lander.Number}
+	if got := queueOrder(fx.f); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("queue should hold the parts bottom up, not the activation PR: %v", got)
+	}
+	for i := 0; i < 3; i++ {
+		if p := prBy(t, fx, i); p.BaseRef != fx.s.Branches[i].Parent || !fx.f.Labels[p.Number][land.LabelLanding] {
+			t.Fatalf("part %d: base=%s labels=%v (stackq must not retarget)", i+1, p.BaseRef, fx.f.Labels[p.Number])
+		}
+	}
+	if !strings.Contains(prBy(t, fx, 2).Body, "stackq:merge-request") {
+		t.Fatal("the merge request is not recorded on the lander")
+	}
 
+	// The queue lands them; the next tick finishes the stack.
+	fx.landQueue(t, "rebase")
+	if err := fx.ci(t).FinishLanded(); err != nil {
+		t.Fatal(err)
+	}
+	ci := testrepo.Clone(t, fx.bare)
+	if !ci.TreesEqual("origin/main", lander.HeadSHA) {
+		t.Fatal("trunk is not exactly the stack minus activation")
+	}
+	if n := ci.CountCommits(before, "origin/main"); n != 3 {
+		t.Fatalf("want the 3 parts on trunk, got %d commits", n)
+	}
+	if out := testrepo.Must(t, ci, "show", "origin/main:config/prod.yaml"); strings.Contains(out, "true") {
+		t.Fatal("activation reached trunk")
+	}
+	for i := 0; i < 3; i++ {
+		p := prBy(t, fx, i)
+		if !p.Merged() || fx.f.Labels[p.Number][land.LabelLanding] {
+			t.Fatalf("part %d: state=%s labels=%v", i+1, p.State, fx.f.Labels[p.Number])
+		}
+	}
+	if b := prBy(t, fx, 2).Body; !strings.Contains(b, "Landed") || strings.Contains(b, "stackq:merge-request") {
+		t.Fatalf("lander status not finished:\n%s", b)
+	}
+	h := prBy(t, fx, 3)
+	if h.BaseRef != "main" || !fx.f.Labels[h.Number][land.LabelActivation] || !h.Open() {
+		t.Fatalf("activation PR: base=%s labels=%v state=%s", h.BaseRef, fx.f.Labels[h.Number], h.State)
+	}
+	if !strings.Contains(comments(fx, hold.Number), "stackq will not merge it") {
+		t.Fatalf("activation PR not told: %q", fx.f.Comments[hold.Number])
+	}
+	if c := comments(fx, orig.Number); !strings.Contains(c, "has landed on `main`") || !strings.Contains(c, fmt.Sprintf("#%d", hold.Number)) {
+		t.Fatalf("original PR not told: %q", c)
+	}
+	if !strings.Contains(prBy(t, fx, 3).Body, "✅") {
+		t.Fatal("nav not refreshed on the activation PR")
+	}
+
+	// Finishing again changes nothing.
+	n := len(fx.f.Comments[orig.Number]) + len(fx.f.Comments[hold.Number])
+	if err := fx.ci(t).FinishLanded(); err != nil || len(fx.f.Comments[orig.Number])+len(fx.f.Comments[hold.Number]) != n {
+		t.Fatalf("a finished stack must be left alone: %v", err)
+	}
+
+	// One command rolls the whole stack back.
+	rev, err := fx.ci(t).Revert(lander.Number, land.RevertOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci = testrepo.Clone(t, fx.bare)
+	if !ci.TreesEqual("origin/"+rev.HeadRef, before) || !strings.Contains(rev.Body, "| rebase |") ||
+		!strings.Contains(rev.Body, "✅ The revert touches exactly") {
+		t.Fatalf("revert PR wrong:\n%s", rev.Body)
+	}
+}
+
+// Each part merges on its own in a GitHub stack, so revert has to find each
+// part's own commits, for every merge method.
+func TestRevertAfterAStackLandsWithEachMergeMethod(t *testing.T) {
+	for _, method := range []string{"rebase", "merge", "squash"} {
+		t.Run(method, func(t *testing.T) {
+			fx := setupWith(t, testrepo.GoApp(t), nil, stack.Atomic)
+			run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+			if err := run.Land(prBy(t, fx, 0).Number); err != nil {
+				t.Fatal(err)
+			}
+			before := fx.mainTip(t)
+			fx.landQueue(t, method)
+			// Someone else lands an unrelated change afterwards.
+			other := testrepo.Clone(t, fx.bare)
+			testrepo.Commit(t, other, "unrelated", map[string]string{"NOTES.txt": "later\n"})
+			testrepo.Must(t, other, "push", "-q", "origin", "main")
+
+			top := prBy(t, fx, len(fx.s.Branches)-1)
+			rev, err := fx.ci(t).Revert(top.Number, land.RevertOptions{Enqueue: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ci := testrepo.Clone(t, fx.bare)
+			if d := ci.ChangedFiles(before, "origin/"+rev.HeadRef); len(d) != 1 || d[0] != "NOTES.txt" {
+				t.Fatalf("after revert the only difference from pre-stack main should be NOTES.txt, got %v", d)
+			}
+			// Each part is one commit, so its squash is the same patch as a
+			// rebase, and revert may call it either; both revert correctly.
+			described := strings.Contains(rev.Body, "| "+method+" |") || method == "squash" && strings.Contains(rev.Body, "| rebase |")
+			if !described || fx.f.Merges[len(fx.f.Merges)-1] != rev.Number {
+				t.Fatalf("revert PR not described or not merged (merges %v, revert #%d):\n%s", fx.f.Merges, rev.Number, rev.Body)
+			}
+		})
+	}
+}
+
+func TestIncrementalStackLandsPartByPart(t *testing.T) {
+	fx := setup(t) // incremental
+	n := len(fx.s.Branches)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := run.Land(prBy(t, fx, 0).Number); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < n; i++ {
-		if err := fx.queueMerges(t, i); err != nil {
-			t.Fatalf("after merging %d: %v", i+1, err)
+		if len(fx.f.Merges) != i+1 || fx.f.Merges[i] != prBy(t, fx, i).Number {
+			t.Fatalf("step %d: want a merge request for part %d alone, got %v", i, i+1, fx.f.Merges)
 		}
-		if i == n-1 {
-			break
+		if got := fx.landQueue(t, "rebase"); len(got) != 1 {
+			t.Fatalf("step %d: one PR should land at a time, got %v", i, got)
 		}
-		next := fx.s.Branches[i+1]
-		pr, _ := fx.f.GetPR(next.PR)
-		m, _ := stack.ParseMarker(pr.Body)
-		if pr.BaseRef != "main" || m.Parent != "main" {
-			t.Fatalf("#%d not retargeted: base=%s parent=%s", pr.Number, pr.BaseRef, m.Parent)
+		if i+1 < n && prBy(t, fx, i+1).BaseRef != "main" {
+			t.Fatalf("GitHub retargets the next part onto main")
 		}
-		if got := fx.f.Enqueued[len(fx.f.Enqueued)-1]; got != pr.Number {
-			t.Fatalf("expected #%d queued, last queued #%d", pr.Number, got)
-		}
-		tip := testrepo.Must(t, fx.bare, "rev-parse", "refs/heads/main")
-		if mb := testrepo.Must(t, fx.bare, "merge-base", "refs/heads/main", "refs/heads/"+next.Name); mb != tip {
-			t.Fatalf("%s is not on top of main", next.Name)
-		}
-		if c := testrepo.Must(t, fx.bare, "rev-list", "--count", "refs/heads/main..refs/heads/"+next.Name); c != "1" {
-			t.Fatalf("%s carries %s commits over main, want only its own", next.Name, c)
-		}
-		if !strings.Contains(pr.Body, "✅") {
-			t.Fatalf("nav not refreshed on #%d", pr.Number)
+		if err := fx.ci(t).AfterMerge(prBy(t, fx, i).Number); err != nil {
+			t.Fatal(err)
 		}
 	}
-
-	// Everything landed; main now equals the original big branch.
-	testrepo.Must(t, fx.dev, "fetch", "-q", "origin")
-	if !fx.dev.TreesEqual("feature", "origin/main") {
-		t.Fatal("main differs from the original branch after landing the whole stack")
-	}
-
-	// The developer's local stack catches up cleanly.
-	if err := stack.Sync(fx.dev, fx.s, stack.SyncOptions{Fetch: true}); err != nil {
-		t.Fatal(err)
-	}
-	if len(fx.s.Active()) != 0 {
-		t.Fatalf("expected the whole stack to be marked landed, %d left", len(fx.s.Active()))
+	// The top part's branch is byte for byte the feature branch.
+	if top := prBy(t, fx, n-1); !testrepo.Clone(t, fx.bare).TreesEqual("origin/main", top.HeadSHA) {
+		t.Fatal("trunk is not the feature after every part landed")
 	}
 }
 
-func TestDevPicksUpCIRestackThenKeepsWorking(t *testing.T) {
+// GitHub merges a stacked PR together with every open PR below it, so landing
+// a higher PR of an incremental stack lands those too.
+func TestLandingAHigherPartOfAnIncrementalStackTakesTheOnesBelow(t *testing.T) {
 	fx := setup(t)
-	if err := fx.queueMerges(t, 0); err != nil {
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := run.Land(prBy(t, fx, 2).Number); err != nil {
 		t.Fatal(err)
 	}
-	if err := stack.Sync(fx.dev, fx.s, stack.SyncOptions{Fetch: true}); err != nil {
-		t.Fatal(err)
-	}
-	b := fx.s.Branches[1]
-	remote := testrepo.Must(t, fx.bare, "rev-parse", "refs/heads/"+b.Name)
-	if local, _ := fx.dev.RevParse(b.Name); local != remote {
-		t.Fatal("local branch did not take CI's restack")
-	}
-	// A follow-up push after more local work must not be rejected.
-	testrepo.Must(t, fx.dev, "checkout", "-q", b.Name)
-	testrepo.Commit(t, fx.dev, "follow-up", map[string]string{"internal/types/extra.go": "package types\n"})
-	testrepo.Must(t, fx.dev, "checkout", "-q", "feature")
-	if err := stack.Sync(fx.dev, fx.s, stack.SyncOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := stack.Push(fx.dev, fx.f, fx.s, stack.PushOptions{}); err != nil {
-		t.Fatal(err)
+	want := []int{prBy(t, fx, 0).Number, prBy(t, fx, 1).Number, prBy(t, fx, 2).Number}
+	if fmt.Sprint(queueOrder(fx.f)) != fmt.Sprint(want) || len(fx.f.Merges) != 1 {
+		t.Fatalf("want one request queueing parts 1-3, got merges=%v queue=%v", fx.f.Merges, queueOrder(fx.f))
 	}
 }
 
-func TestConflictPausesStack(t *testing.T) {
-	fx := setup(t)
-	// Someone changes the same file slice 2 touches, on trunk.
-	other := testrepo.Clone(t, fx.bare)
-	testrepo.Commit(t, other, "conflicting", map[string]string{"internal/types/types.go": "package types\n\ntype ID int\n"})
-	testrepo.Must(t, other, "push", "-q", "origin", "main")
+func TestAutoLandWaitsQuietlyThenLandsOnce(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	lander, part2 := prBy(t, fx, 2), prBy(t, fx, 1)
 
-	child := fx.s.Branches[1]
-	before := testrepo.Must(t, fx.bare, "rev-parse", "refs/heads/"+child.Name)
-	err := fx.queueMerges(t, 0)
-	if err == nil || !strings.Contains(err.Error(), "paused") {
-		t.Fatalf("expected the stack to pause, got %v", err)
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "pending" })
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
 	}
-	if !fx.f.Labels[child.PR][land.LabelConflict] || len(fx.f.Comments[child.PR]) == 0 ||
-		!strings.Contains(fx.f.Comments[child.PR][0], "internal/types/types.go") {
-		t.Fatalf("conflict not reported on #%d: %v", child.PR, fx.f.Comments)
+	if len(fx.f.Merges) != 0 || len(fx.f.Comments[lander.Number]) != 0 {
+		t.Fatalf("a stack that isn't ready must wait without noise: %v %q", fx.f.Merges, fx.f.Comments[lander.Number])
 	}
-	if after := testrepo.Must(t, fx.bare, "rev-parse", "refs/heads/"+child.Name); after != before {
-		t.Fatal("a conflicted branch must not be pushed")
+	if b := prBy(t, fx, 2).Body; !strings.Contains(b, "Not landing yet") || !strings.Contains(b, fmt.Sprintf("#%d: checks are still running", part2.Number)) {
+		t.Fatalf("the waiting reason should be on the lander:\n%s", b)
 	}
-	for _, q := range fx.f.Enqueued {
-		if q == child.PR {
-			t.Fatal("a conflicted PR must not be queued")
+
+	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "success" })
+	for i := 0; i < 2; i++ {
+		if err := run.AutoLand(); err != nil {
+			t.Fatal(err)
 		}
 	}
-}
-
-func TestEnqueueFailureIsReported(t *testing.T) {
-	fx := setup(t)
-	fx.f.EnqueueErr = errors.New("required checks are failing")
-	if err := fx.queueMerges(t, 0); err == nil {
-		t.Fatal("expected an error")
+	if len(fx.f.Merges) != 1 || fx.f.Merges[0] != lander.Number {
+		t.Fatalf("want exactly one merge request, got %v", fx.f.Merges)
 	}
-	child := fx.s.Branches[1].PR
-	if !fx.f.Labels[child][land.LabelBlocked] {
-		t.Fatal("blocked label missing")
+	if b := prBy(t, fx, 2).Body; !strings.Contains(b, "Landing.") || strings.Contains(b, "Not landing yet") {
+		t.Fatalf("status not updated:\n%s", b)
 	}
 }
 
-func TestFinalEnqueueRefusalReachesThePRInPlainWords(t *testing.T) {
-	fx := setup(t)
-	child := fx.s.Branches[1].PR
-	fx.f.EnqueueErr = &forge.EnqueueError{PR: child, Kind: "draft", Detail: "Pull request is in draft"}
-	if err := fx.queueMerges(t, 0); err == nil {
-		t.Fatal("expected the stack to pause")
+func TestAMergeRequestThatIsPendingThenFailsPausesTheStack(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	lander := prBy(t, fx, 2)
+	fx.f.MergePending = true
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
 	}
-	if !fx.f.Labels[child][land.LabelBlocked] {
-		t.Fatal("blocked label missing")
+	fx.f.MQ = nil // GitHub has not put anything in the queue yet
+	if err := run.AutoLand(); err != nil || len(fx.f.Merges) != 1 {
+		t.Fatalf("a pending request must not be made again: %v %v", err, fx.f.Merges)
 	}
-	var said string
-	for _, c := range fx.f.Comments[child] {
-		said += c
+
+	for _, r := range fx.f.Requests {
+		r.Status, r.Message = forge.MergeFailed, "Required status check \"test\" is expected."
 	}
-	if !strings.Contains(said, "mark it ready for review") {
-		t.Fatalf("the PR should hear the cause, got %q", said)
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
+	}
+	if !fx.f.Labels[lander.Number][land.LabelBlocked] || !strings.Contains(comments(fx, lander.Number), "is expected") {
+		t.Fatalf("the failure should pause the stack and quote GitHub: %v %q", fx.f.Labels[lander.Number], fx.f.Comments[lander.Number])
+	}
+	if b := prBy(t, fx, 2).Body; !strings.Contains(b, "Paused.") || strings.Contains(b, "stackq:merge-request") {
+		t.Fatalf("status should say paused:\n%s", b)
+	}
+	if err := run.AutoLand(); err != nil || len(fx.f.Merges) != 1 {
+		t.Fatalf("a paused stack is left alone: %v %v", err, fx.f.Merges)
+	}
+
+	// After a fix, landing by hand asks again and clears the pause.
+	fx.f.MergePending = false
+	if err := run.Land(lander.Number); err != nil {
+		t.Fatal(err)
+	}
+	if fx.f.Labels[lander.Number][land.LabelBlocked] || len(fx.f.Merges) != 2 {
+		t.Fatalf("manual land did not resume: labels=%v merges=%v", fx.f.Labels[lander.Number], fx.f.Merges)
+	}
+}
+
+func TestAStackThatSilentlyLeftTheQueueIsPaused(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
+	}
+	lander := prBy(t, fx, 2)
+	fx.f.MQ = nil // ejected, and the dequeued run was lost
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
+	}
+	if !fx.f.Labels[lander.Number][land.LabelBlocked] || !strings.Contains(prBy(t, fx, 2).Body, "Paused.") {
+		t.Fatalf("a lander that left the queue should be paused: %v", fx.f.Labels[lander.Number])
 	}
 }
 
@@ -272,9 +419,51 @@ func TestDequeuedPausesStack(t *testing.T) {
 	if !fx.f.Labels[pr][land.LabelBlocked] || len(fx.f.Comments[pr]) != 1 {
 		t.Fatal("dequeue not reported")
 	}
-	fx.f.EnqueueErr = nil
 	if err := run.Land(pr); err != nil || fx.f.Labels[pr][land.LabelBlocked] {
-		t.Fatalf("retry should requeue and clear the label: %v", err)
+		t.Fatalf("retry should ask again and clear the label: %v", err)
+	}
+}
+
+func TestMergeErrorIsReported(t *testing.T) {
+	fx := setup(t)
+	fx.f.MergeErr = errors.New("HTTP 403: Resource not accessible by integration")
+	if err := (&land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}).Land(fx.s.Branches[0].PR); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("expected GitHub's error, got %v", err)
+	}
+}
+
+func TestAStackThatIsNotAGitHubStackIsLinkedWhenItLands(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	fx.f.Stacks = map[int][]int{} // pushed before stackq used GitHub stacks
+	var log bytes.Buffer
+	if err := (&land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", Log: &log}).Land(prBy(t, fx, 0).Number); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := fx.f.StackOf(prBy(t, fx, 0).Number); st == 0 || !strings.Contains(log.String(), "linked") {
+		t.Fatalf("the PRs should be linked first:\n%s", log.String())
+	}
+	if len(fx.f.MQ) != 3 {
+		t.Fatalf("then landed as one stack: %v", queueOrder(fx.f))
+	}
+}
+
+func TestTheActivationPRLandsOnlyWhenNamed(t *testing.T) {
+	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
+	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
+	if err := run.AutoLand(); err != nil {
+		t.Fatal(err)
+	}
+	fx.landQueue(t, "rebase")
+	if err := fx.ci(t).FinishLanded(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.AutoLand(); err != nil || len(fx.f.Merges) != 1 {
+		t.Fatalf("auto-land must never merge the activation PR: %v %v", err, fx.f.Merges)
+	}
+	hold := prBy(t, fx, 3)
+	fx.f.PRs[hold.Number].Draft = false // a human marks it ready
+	if err := run.Land(hold.Number); err != nil || fx.f.Merges[len(fx.f.Merges)-1] != hold.Number {
+		t.Fatalf("landing it by name should work: %v %v", err, fx.f.Merges)
 	}
 }
 
@@ -282,367 +471,8 @@ func TestIgnoresForeignPRs(t *testing.T) {
 	fx := setup(t)
 	pr, _ := fx.f.CreatePR("someone/else", "main", "unrelated", "no marker here", false)
 	fx.f.MarkMerged(pr.Number)
-	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", Enqueue: true}
-	if err := run.AfterMerge(pr.Number); err != nil || len(fx.f.Enqueued) != 0 {
-		t.Fatalf("foreign PR should be a no-op: %v %v", err, fx.f.Enqueued)
-	}
-}
-
-func TestOriginalPRHearsWhenStackLands(t *testing.T) {
-	fx := setup(t)
-	orig, _ := fx.f.CreatePR("feature", "main", "Big refactor", "desc", false)
-	if err := stack.Push(fx.dev, fx.f, fx.s, stack.PushOptions{SourcePR: orig.Number, CloseSource: true}); err != nil {
-		t.Fatal(err)
-	}
-	for i := range fx.s.Branches {
-		if err := fx.queueMerges(t, i); err != nil {
-			t.Fatal(err)
-		}
-		if i < len(fx.s.Branches)-1 && len(fx.f.Comments[orig.Number]) != 1 {
-			t.Fatalf("landed note posted early after #%d", i+1)
-		}
-	}
-	cs := fx.f.Comments[orig.Number]
-	if len(cs) != 2 || !strings.Contains(cs[1], "has landed on `main`") {
-		t.Fatalf("want link comment + landed note, got %q", cs)
-	}
-}
-
-func prBy(t *testing.T, fx *fixture, i int) forge.PR {
-	t.Helper()
-	pr, err := fx.f.GetPR(fx.s.Branches[i].PR)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pr
-}
-
-func TestAtomicStackLandsAsOneEntryAndActivationWaits(t *testing.T) {
-	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
-	// flags, internal/checkout, cmd/shop, activation (held)
-	if n := len(fx.s.Branches); n != 4 || !fx.s.Branches[3].Hold || fx.s.Branches[0].Name != "stack/feat/01-flags" {
-		t.Fatalf("unexpected stack: %+v", fx.s.Branches)
-	}
-	lander, hold := prBy(t, fx, 2), prBy(t, fx, 3)
-	if !strings.Contains(lander.Body, "(lander)") || !strings.Contains(hold.Body, "Activation PR") {
-		t.Fatalf("bodies don't explain the landing:\n%s\n---\n%s", lander.Body, hold.Body)
-	}
-	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-
-	// Gate: part 2 is not approved yet.
-	fx.f.SetDetails(prBy(t, fx, 1).Number, func(d *forge.Details) { d.Approvals = nil })
-	err := run.Land(prBy(t, fx, 0).Number)
-	if err == nil || !strings.Contains(err.Error(), "required approvals") || len(fx.f.Enqueued) != 0 {
-		t.Fatalf("unapproved part must block landing: %v %v", err, fx.f.Enqueued)
-	}
-	if !fx.f.Labels[lander.Number][land.LabelBlocked] {
-		t.Fatal("blocked label missing on the lander")
-	}
-	fx.f.SetDetails(prBy(t, fx, 1).Number, func(d *forge.Details) { d.Approvals = []string{"ana"} })
-
-	before := fx.mainTip(t)
-	if err := run.Land(prBy(t, fx, 0).Number); err != nil {
-		t.Fatal(err)
-	}
-	if lp := prBy(t, fx, 2); lp.BaseRef != "main" || len(fx.f.Enqueued) != 1 || fx.f.Enqueued[0] != lp.Number {
-		t.Fatalf("lander not retargeted and queued alone: base=%s queued=%v", lp.BaseRef, fx.f.Enqueued)
-	}
-
-	// The queue merges the lander: trunk gets every part at once.
-	if err := fx.queueLands(t, lander.Number, "rebase"); err != nil {
-		t.Fatal(err)
-	}
-	ci := testrepo.Clone(t, fx.bare)
-	if !ci.TreesEqual("origin/main", lander.HeadSHA) {
-		t.Fatal("trunk is not exactly the stack minus activation")
-	}
-	if n := ci.CountCommits(before, "origin/main"); n != 3 {
-		t.Fatalf("want the 3 parts on trunk, got %d commits", n)
-	}
-	if out := testrepo.Must(t, ci, "show", "origin/main:config/prod.yaml"); strings.Contains(out, "true") {
-		t.Fatal("activation reached trunk")
-	}
-	for i := 0; i < 2; i++ {
-		p := prBy(t, fx, i)
-		if p.State != "CLOSED" || !strings.Contains(fx.f.Comments[p.Number][len(fx.f.Comments[p.Number])-1], "Landed on `main`") {
-			t.Fatalf("part %d not closed as landed: %s", i+1, p.State)
-		}
-		if ci.RefExists("origin/" + p.HeadRef) {
-			t.Fatalf("branch %s not cleaned up", p.HeadRef)
-		}
-	}
-	h := prBy(t, fx, 3)
-	if h.BaseRef != "main" || !fx.f.Labels[h.Number][land.LabelActivation] || len(fx.f.Enqueued) != 1 {
-		t.Fatalf("activation PR: base=%s labels=%v queued=%v", h.BaseRef, fx.f.Labels[h.Number], fx.f.Enqueued)
-	}
-	if c := testrepo.Must(t, fx.bare, "rev-list", "--count", "refs/heads/main..refs/heads/"+h.HeadRef); c != "1" {
-		t.Fatalf("activation branch carries %s commits over main", c)
-	}
-	if lc := fx.f.Comments[lander.Number]; !strings.Contains(lc[len(lc)-1], "landed atomically") ||
-		!strings.Contains(lc[len(lc)-1], "stackq revert --pr") {
-		t.Fatalf("landing record missing: %q", lc)
-	}
-	if !strings.Contains(prBy(t, fx, 3).Body, "✅") {
-		t.Fatal("nav not refreshed on the activation PR")
-	}
-
-	// One command rolls the whole stack back.
-	rev, err := (&land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin"}).Revert(lander.Number, land.RevertOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ci = testrepo.Clone(t, fx.bare)
-	if !ci.TreesEqual("origin/"+rev.HeadRef, before) || rev.BaseRef != "main" || !strings.Contains(rev.Body, "| rebase |") ||
-		!strings.Contains(rev.Body, "✅ The revert touches exactly") {
-		t.Fatalf("revert PR wrong: base=%s\n%s", rev.BaseRef, rev.Body)
-	}
-}
-
-func TestAtomicRevertMergeAndSquashMethods(t *testing.T) {
-	for _, method := range []string{"merge", "squash"} {
-		t.Run(method, func(t *testing.T) {
-			fx := setupWith(t, testrepo.GoApp(t), nil, stack.Atomic)
-			run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-			if err := run.Land(prBy(t, fx, 0).Number); err != nil {
-				t.Fatal(err)
-			}
-			before := fx.mainTip(t)
-			top := prBy(t, fx, len(fx.s.Branches)-1)
-			if err := fx.queueLands(t, top.Number, method); err != nil {
-				t.Fatal(err)
-			}
-			// Someone else lands an unrelated change afterwards.
-			other := testrepo.Clone(t, fx.bare)
-			testrepo.Commit(t, other, "unrelated", map[string]string{"NOTES.txt": "later\n"})
-			testrepo.Must(t, other, "push", "-q", "origin", "main")
-
-			rev, err := (&land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin"}).Revert(top.Number, land.RevertOptions{Enqueue: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			ci := testrepo.Clone(t, fx.bare)
-			// The revert undoes the stack and keeps the later change.
-			if d := ci.ChangedFiles(before, "origin/"+rev.HeadRef); len(d) != 1 || d[0] != "NOTES.txt" {
-				t.Fatalf("after revert the only difference from pre-stack main should be NOTES.txt, got %v", d)
-			}
-			if !strings.Contains(rev.Body, "| "+method+" |") || fx.f.Enqueued[len(fx.f.Enqueued)-1] != rev.Number {
-				t.Fatalf("revert PR not described or not queued:\n%s", rev.Body)
-			}
-		})
-	}
-}
-
-func TestAtomicPartMergedAloneIsNotQueuedOn(t *testing.T) {
-	fx := setupWith(t, testrepo.GoApp(t), nil, stack.Atomic)
-	first := prBy(t, fx, 0)
-	if err := fx.queueLands(t, first.Number, "rebase"); err != nil {
-		t.Fatal(err)
-	}
-	second := prBy(t, fx, 1)
-	if second.BaseRef != "main" || len(fx.f.Enqueued) != 0 {
-		t.Fatalf("restack expected without queueing: base=%s queued=%v", second.BaseRef, fx.f.Enqueued)
-	}
-	if cs := fx.f.Comments[second.Number]; len(cs) == 0 || !strings.Contains(cs[0], "merged on its own") {
-		t.Fatalf("no warning on #%d: %q", second.Number, cs)
-	}
-	// The remainder still lands together.
-	if err := (&land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}).Land(second.Number); err != nil {
-		t.Fatal(err)
-	}
-	if top := prBy(t, fx, len(fx.s.Branches)-1); len(fx.f.Enqueued) != 1 || fx.f.Enqueued[0] != top.Number {
-		t.Fatalf("remainder not landed via the top PR: %v", fx.f.Enqueued)
-	}
-}
-
-func TestIncrementalStackLeavesActivationForHumans(t *testing.T) {
-	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, "")
-	orig, _ := fx.f.CreatePR("feature", "main", "New checkout", "desc", false)
-	if err := stack.Push(fx.dev, fx.f, fx.s, stack.PushOptions{SourcePR: orig.Number}); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 3; i++ {
-		if err := fx.queueLands(t, prBy(t, fx, i).Number, "rebase"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	h := prBy(t, fx, 3)
-	for _, q := range fx.f.Enqueued {
-		if q == h.Number {
-			t.Fatal("activation PR was queued automatically")
-		}
-	}
-	if h.BaseRef != "main" || !fx.f.Labels[h.Number][land.LabelActivation] {
-		t.Fatal("activation PR not restacked onto main")
-	}
-	cs := fx.f.Comments[orig.Number]
-	if !strings.Contains(cs[len(cs)-1], "activation PR") {
-		t.Fatalf("original PR not told about the waiting activation: %q", cs)
-	}
-}
-
-func TestAutoLandWaitsQuietlyThenLandsOnce(t *testing.T) {
-	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
-	lander, part2 := prBy(t, fx, 2), prBy(t, fx, 1)
-	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-
-	quiet := func(why string) {
-		t.Helper()
-		if err := run.AutoLand(); err != nil {
-			t.Fatalf("%s: auto-land must not fail while waiting: %v", why, err)
-		}
-		if len(fx.f.Enqueued) != 0 || prBy(t, fx, 2).BaseRef == "main" {
-			t.Fatalf("%s: stack was queued", why)
-		}
-		if len(fx.f.Comments[lander.Number]) != 0 || fx.f.Labels[lander.Number][land.LabelBlocked] {
-			t.Fatalf("%s: waiting must not comment or label: %q %v", why, fx.f.Comments[lander.Number], fx.f.Labels[lander.Number])
-		}
-	}
-	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Approvals = nil })
-	quiet("missing approval")
-	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Approvals = []string{"ana"}; d.Checks = "pending" })
-	quiet("checks running")
-	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "failure" })
-	quiet("checks failing")
-	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "none" })
-	quiet("no checks reported yet")
-	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "success" })
-
-	if err := run.AutoLand(); err != nil {
-		t.Fatal(err)
-	}
-	if lp := prBy(t, fx, 2); lp.BaseRef != "main" || len(fx.f.Enqueued) != 1 || fx.f.Enqueued[0] != lp.Number {
-		t.Fatalf("ready stack not queued as one entry: base=%s queued=%v", lp.BaseRef, fx.f.Enqueued)
-	}
-	comments := len(fx.f.Comments[lander.Number])
-
-	// The next approval, CI run or timer tick must not queue it again.
-	for i := 0; i < 3; i++ {
-		if err := run.AutoLand(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(fx.f.Enqueued) != 1 || len(fx.f.Comments[lander.Number]) != comments {
-		t.Fatalf("landing repeated: queued=%v comments=%d (was %d)", fx.f.Enqueued, len(fx.f.Comments[lander.Number]), comments)
-	}
-}
-
-// The queue can drop the lander without the dequeued run ever handling it
-// (a newer run in the concurrency group replaces a pending one). The next tick
-// must notice and pause the stack once, instead of calling it landing forever.
-func TestAutoLandPausesALanderThatSilentlyLeftTheQueue(t *testing.T) {
-	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
-	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-	if err := run.AutoLand(); err != nil {
-		t.Fatal(err)
-	}
-	lander := prBy(t, fx, 2)
-	if lander.BaseRef != "main" || len(fx.f.MQ) != 1 {
-		t.Fatalf("stack not queued: base=%s queue=%v", lander.BaseRef, fx.f.MQ)
-	}
-	comments := len(fx.f.Comments[lander.Number])
-	tick := func(why string) {
-		t.Helper()
-		if err := run.AutoLand(); err != nil {
-			t.Fatalf("%s: %v", why, err)
-		}
-	}
-	unchanged := func(why string) {
-		t.Helper()
-		if fx.f.Labels[lander.Number][land.LabelBlocked] || len(fx.f.Comments[lander.Number]) != comments {
-			t.Fatalf("%s: a landing stack was paused: %q", why, fx.f.Comments[lander.Number])
-		}
-	}
-
-	tick("still in the queue")
-	unchanged("still in the queue")
-
-	fx.f.MQ = nil
-	fx.f.SetDetails(lander.Number, func(d *forge.Details) { d.AutoMerge = true })
-	tick("waiting for auto-merge")
-	unchanged("waiting for auto-merge")
-
-	fx.f.QueueErr = errors.New("cannot read the queue")
-	fx.f.SetDetails(lander.Number, func(d *forge.Details) { d.AutoMerge = false })
-	tick("queue unreadable")
-	unchanged("queue unreadable")
-	fx.f.QueueErr = nil
-
-	tick("dropped from the queue")
-	cs := fx.f.Comments[lander.Number]
-	if !fx.f.Labels[lander.Number][land.LabelBlocked] || len(cs) != comments+1 || !strings.Contains(cs[len(cs)-1], "left the merge queue") {
-		t.Fatalf("dropped lander not paused: labels=%v comments=%q", fx.f.Labels[lander.Number], cs)
-	}
-
-	tick("already paused")
-	if len(fx.f.Comments[lander.Number]) != comments+1 || len(fx.f.Enqueued) != 1 {
-		t.Fatalf("paused stack touched again: comments=%d queued=%v", len(fx.f.Comments[lander.Number]), fx.f.Enqueued)
-	}
-
-	// After a fix, landing by hand queues it again and clears the pause.
-	if err := run.Land(lander.Number); err != nil {
-		t.Fatal(err)
-	}
-	if fx.f.Labels[lander.Number][land.LabelBlocked] || len(fx.f.Enqueued) != 2 {
-		t.Fatalf("manual land did not resume: labels=%v queued=%v", fx.f.Labels[lander.Number], fx.f.Enqueued)
-	}
-}
-
-// The reason a stack waits shows on the lander itself, not only in the
-// Actions log, and is rewritten as the stack moves.
-func TestLanderBodyShowsTheLandingStatus(t *testing.T) {
-	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
-	lander, part2 := prBy(t, fx, 2), prBy(t, fx, 1)
-	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-	body := func() string { t.Helper(); return prBy(t, fx, 2).Body }
-	tick := func() {
-		t.Helper()
-		if err := run.AutoLand(); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "pending" })
-	tick()
-	if b := body(); !strings.Contains(b, "Not landing yet") || !strings.Contains(b, fmt.Sprintf("#%d: checks are still running", part2.Number)) {
-		t.Fatalf("waiting reason missing from the lander:\n%s", b)
-	}
-	if strings.Count(body(), "stackq:status:begin") != 1 || !strings.Contains(body(), "stackq:meta") {
-		t.Fatalf("status must sit beside the stack block, once:\n%s", body())
-	}
-	if len(fx.f.Comments[lander.Number]) != 0 {
-		t.Fatalf("waiting must not comment: %q", fx.f.Comments[lander.Number])
-	}
-
-	fx.f.SetDetails(part2.Number, func(d *forge.Details) { d.Checks = "success" })
-	tick()
-	if b := body(); !strings.Contains(b, "Landing.") || strings.Contains(b, "Not landing yet") {
-		t.Fatalf("status not updated when the stack was queued:\n%s", b)
-	}
-
-	// GitHub refused the direct enqueue and turned on auto-merge instead.
-	fx.f.MQ = nil
-	fx.f.SetDetails(lander.Number, func(d *forge.Details) { d.AutoMerge = true })
-	tick()
-	if b := body(); !strings.Contains(b, "Waiting for GitHub's requirements") || !strings.Contains(b, "awaiting approval") || strings.Contains(b, "Landing.") {
-		t.Fatalf("auto-merge wait not explained on the lander:\n%s", b)
-	}
-	fx.f.SetDetails(lander.Number, func(d *forge.Details) { d.AutoMerge = false })
-
-	tick() // dropped without a dequeued run
-	if b := body(); !strings.Contains(b, "Paused.") {
-		t.Fatalf("pause not shown:\n%s", b)
-	}
-
-	if err := run.Land(lander.Number); err != nil {
-		t.Fatal(err)
-	}
-	fx.mergeWithoutHandler(t, lander.Number, "rebase")
-	tidy := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
-	if err := tidy.FinishLanded(); err != nil {
-		t.Fatal(err)
-	}
-	if b := body(); strings.Contains(b, "stackq:status") || !strings.Contains(b, "stackq:meta") {
-		t.Fatalf("status left behind after landing:\n%s", b)
+	if err := fx.ci(t).AfterMerge(pr.Number); err != nil || len(fx.f.Merges) != 0 {
+		t.Fatalf("foreign PR should be a no-op: %v %v", err, fx.f.Merges)
 	}
 }
 
@@ -656,32 +486,15 @@ func TestAnIncompleteStackIsNotLanded(t *testing.T) {
 	hidden := fx.f.PRs[top.Number]
 	delete(fx.f.PRs, top.Number) // the last part has not been created yet
 
-	if err := run.AutoLand(); err != nil {
-		t.Fatalf("auto-land must wait quietly: %v", err)
+	if err := run.AutoLand(); err != nil || len(fx.f.Merges) != 0 {
+		t.Fatalf("auto-land must wait quietly: %v %v", err, fx.f.Merges)
 	}
-	if len(fx.f.Enqueued) != 0 || prBy(t, fx, 1).BaseRef == "main" {
-		t.Fatalf("an incomplete stack was landed: queued=%v base=%s", fx.f.Enqueued, prBy(t, fx, 1).BaseRef)
-	}
-	err := run.Land(prBy(t, fx, 0).Number)
-	if err == nil || !strings.Contains(err.Error(), "3 of 4 PRs") {
+	if err := run.Land(prBy(t, fx, 0).Number); err == nil || !strings.Contains(err.Error(), "3 of 4 PRs") {
 		t.Fatalf("a manual land must say the stack is incomplete, got %v", err)
 	}
-
 	fx.f.PRs[top.Number] = hidden // the split finishes
-	if err := run.AutoLand(); err != nil {
-		t.Fatal(err)
-	}
-	if lp := prBy(t, fx, 2); lp.BaseRef != "main" || len(fx.f.Enqueued) != 1 {
-		t.Fatalf("the complete stack was not landed: base=%s queued=%v", lp.BaseRef, fx.f.Enqueued)
-	}
-}
-
-func TestAutoLandIgnoresIncrementalStacksAndForeignPRs(t *testing.T) {
-	fx := setup(t) // incremental stack
-	fx.f.CreatePR("someone/else", "main", "unrelated", "no marker here", false)
-	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-	if err := run.AutoLand(); err != nil || len(fx.f.Enqueued) != 0 {
-		t.Fatalf("incremental stacks and plain PRs are not auto-landed: %v %v", err, fx.f.Enqueued)
+	if err := run.AutoLand(); err != nil || len(fx.f.Merges) != 1 || fx.f.Merges[0] != top.Number {
+		t.Fatalf("the complete stack was not landed: %v %v", err, fx.f.Merges)
 	}
 }
 
@@ -691,19 +504,18 @@ func TestAutoLandWithoutApprovalsWhenAllowed(t *testing.T) {
 		fx.f.SetDetails(prBy(t, fx, i).Number, func(d *forge.Details) { d.Approvals = nil })
 	}
 	strict := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-	if err := strict.AutoLand(); err != nil || len(fx.f.Enqueued) != 0 {
-		t.Fatalf("unreviewed stack must wait by default: %v %v", err, fx.f.Enqueued)
+	if err := strict.AutoLand(); err != nil || len(fx.f.Merges) != 0 {
+		t.Fatalf("unreviewed stack must wait by default: %v %v", err, fx.f.Merges)
 	}
 	lax := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", AllowUnreviewed: true}
-	if err := lax.AutoLand(); err != nil || len(fx.f.Enqueued) != 1 {
-		t.Fatalf("allowUnreviewed should land it: %v %v", err, fx.f.Enqueued)
+	if err := lax.AutoLand(); err != nil || len(fx.f.Merges) != 1 {
+		t.Fatalf("allowUnreviewed should land it: %v %v", err, fx.f.Merges)
 	}
-	// Still gated on checks.
 	fx2 := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
 	fx2.f.SetDetails(prBy(t, fx2, 1).Number, func(d *forge.Details) { d.Approvals = nil; d.Checks = "failure" })
 	lax2 := &land.Runner{Repo: fx2.dev, Forge: fx2.f, Remote: "origin", AllowUnreviewed: true}
-	if err := lax2.AutoLand(); err != nil || len(fx2.f.Enqueued) != 0 {
-		t.Fatalf("red checks must still block: %v %v", err, fx2.f.Enqueued)
+	if err := lax2.AutoLand(); err != nil || len(fx2.f.Merges) != 0 {
+		t.Fatalf("red checks must still block: %v %v", err, fx2.f.Merges)
 	}
 }
 
@@ -712,99 +524,37 @@ func TestManualLandStillAcceptsPartsWithoutChecks(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		fx.f.SetDetails(prBy(t, fx, i).Number, func(d *forge.Details) { d.Checks = "none" })
 	}
-	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-	if err := run.Land(prBy(t, fx, 0).Number); err != nil || len(fx.f.Enqueued) != 1 {
-		t.Fatalf("a person running land can accept parts with no CI: %v %v", err, fx.f.Enqueued)
-	}
-}
-
-func TestFinishLandedCleansUpWhenTheHandlerNeverRan(t *testing.T) {
-	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
-	lander := prBy(t, fx, 2)
-	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}
-	if err := run.Land(prBy(t, fx, 0).Number); err != nil {
-		t.Fatal(err)
-	}
-	fx.mergeWithoutHandler(t, lander.Number, "rebase")
-
-	// Nothing ran after the merge: the parts are open, the held PR still targets
-	// a stack branch.
-	if prBy(t, fx, 0).State != "OPEN" || prBy(t, fx, 3).BaseRef == "main" {
-		t.Fatal("test setup: the cleanup must not have run yet")
-	}
-
-	tidy := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
-	if err := tidy.FinishLanded(); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 2; i++ {
-		if p := prBy(t, fx, i); p.State != "CLOSED" {
-			t.Fatalf("part %d should be closed, is %s", i+1, p.State)
-		}
-	}
-	if h := prBy(t, fx, 3); h.BaseRef != "main" || h.State != "OPEN" || !fx.f.Labels[h.Number][land.LabelActivation] {
-		t.Fatalf("held PR not retargeted to main and left open: base=%s state=%s labels=%v", h.BaseRef, h.State, fx.f.Labels[h.Number])
-	}
-	lc := fx.f.Comments[lander.Number]
-	if !strings.Contains(lc[len(lc)-1], "landed atomically") {
-		t.Fatalf("landing record missing: %q", lc)
-	}
-
-	// A second tick finds nothing to do.
-	before := len(fx.f.Comments[lander.Number])
-	for i := 0; i < 2; i++ {
-		again := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Enqueue: true}
-		if err := again.FinishLanded(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := len(fx.f.Comments[lander.Number]); got != before {
-		t.Fatalf("a tidy stack was processed again: %d comments, was %d", got, before)
+	if err := (&land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}).Land(prBy(t, fx, 0).Number); err != nil || len(fx.f.Merges) != 1 {
+		t.Fatalf("a person landing by hand may land a repo without CI: %v %v", err, fx.f.Merges)
 	}
 }
 
 func TestFinishLandedLeavesUnlandedStacksAlone(t *testing.T) {
 	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
-	run := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin"}
-	if err := run.FinishLanded(); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 4; i++ {
-		if p := prBy(t, fx, i); p.State != "OPEN" || len(fx.f.Comments[p.Number]) != 0 {
-			t.Fatalf("part %d touched before landing: %s %q", i+1, p.State, fx.f.Comments[p.Number])
-		}
+	if err := fx.ci(t).FinishLanded(); err != nil || len(fx.f.Comments) != 0 {
+		t.Fatalf("nothing landed, nothing to do: %v %v", err, fx.f.Comments)
 	}
 }
 
 // Right after the label is added the pool search can lag and not find the PR.
-// The log must not claim the stack went into the queue when it did not.
-func TestAtomicLandOnlyClaimsTheQueueWhenThePoolAdmittedIt(t *testing.T) {
+// The log must not claim the stack went to GitHub when it did not.
+func TestLandOnlyClaimsAMergeWhenThePoolAdmittedIt(t *testing.T) {
 	fx := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
 	var log bytes.Buffer
 	run := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", Prio: prioCfg(), Log: &log}
-
 	fx.f.PoolLag = true
 	if err := run.Land(prBy(t, fx, 0).Number); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(log.String(), "into the queue") || !strings.Contains(log.String(), "stays in the priority pool") || len(fx.f.Enqueued) != 0 {
-		t.Fatalf("the pool missed the PR, the log must say so:\n%s\nqueued: %v", log.String(), fx.f.Enqueued)
+	if strings.Contains(log.String(), "asked GitHub to merge") || !strings.Contains(log.String(), "stays in the priority pool") || len(fx.f.Merges) != 0 {
+		t.Fatalf("the pool missed the PR, the log must say so:\n%s\nmerges: %v", log.String(), fx.f.Merges)
 	}
-
-	// The next pass finds it, as the next event or timer tick would.
 	fx.f.PoolLag = false
-	if _, err := run.Schedule("main", false); err != nil || len(fx.f.Enqueued) != 1 {
-		t.Fatalf("the next pass should queue it: %v %v", err, fx.f.Enqueued)
+	if _, err := run.Schedule("main", false); err != nil || len(fx.f.Merges) != 1 {
+		t.Fatalf("the next pass should merge it: %v %v", err, fx.f.Merges)
 	}
-
-	fx2 := setupWith(t, testrepo.FlagApp(t, "if"), shopFlags, stack.Atomic)
-	var log2 bytes.Buffer
-	run2 := &land.Runner{Repo: fx2.dev, Forge: fx2.f, Remote: "origin", Prio: prioCfg(), Log: &log2}
-	if err := run2.Land(prBy(t, fx2, 0).Number); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(log2.String(), "into the queue") || len(fx2.f.Enqueued) != 1 {
-		t.Fatalf("an admitted stack should say it is in the queue:\n%s", log2.String())
+	if !strings.Contains(prBy(t, fx, 2).Body, "stackq:merge-request") {
+		t.Fatal("a merge made by the pool must be recorded too")
 	}
 }
 
@@ -851,17 +601,69 @@ func TestForgedMarkerCannotTakeOverALanding(t *testing.T) {
 			if err := run.AutoLand(); err != nil {
 				t.Fatalf("a forged PR must be ignored, not break the real stack: %v", err)
 			}
-			for _, n := range fx.f.Enqueued {
+			for _, n := range append(fx.f.Merges, fx.f.Enqueued...) {
 				if n == forged {
-					t.Fatalf("the forged PR #%d was queued", forged)
+					t.Fatalf("the forged PR #%d was merged or queued", forged)
 				}
 			}
-			if len(fx.f.Enqueued) != 1 || fx.f.Enqueued[0] != real.Number {
-				t.Fatalf("the real lander #%d should be queued alone, got %v", real.Number, fx.f.Enqueued)
+			if len(fx.f.Merges) != 1 || fx.f.Merges[0] != real.Number {
+				t.Fatalf("the real lander #%d should be merged, got %v", real.Number, fx.f.Merges)
 			}
 			if len(fx.f.Comments[forged]) != 0 || len(fx.f.Labels[forged]) != 0 {
 				t.Fatalf("the forged PR must not be commented on or labeled: %q %v", fx.f.Comments[forged], fx.f.Labels[forged])
 			}
 		})
+	}
+}
+
+// After a part lands, GitHub rebases the next one onto trunk on the server.
+// A developer's sync must take that version, and later local work must push.
+func TestDevPicksUpGitHubsRestackThenKeepsWorking(t *testing.T) {
+	fx := setup(t)
+	if err := (&land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}).Land(prBy(t, fx, 0).Number); err != nil {
+		t.Fatal(err)
+	}
+	below := prBy(t, fx, 0).HeadSHA
+	fx.landQueue(t, "rebase")
+	b := fx.s.Branches[1]
+	gh := testrepo.Clone(t, fx.bare) // GitHub's server-side rebase of the stack
+	testrepo.Must(t, gh, "checkout", "-q", "-B", b.Name, "origin/"+b.Name)
+	testrepo.Must(t, gh, "rebase", "-q", "--onto", "origin/main", below)
+	testrepo.Must(t, gh, "push", "-q", "-f", "origin", b.Name)
+
+	if err := stack.Sync(fx.dev, fx.s, stack.SyncOptions{Fetch: true}); err != nil {
+		t.Fatal(err)
+	}
+	remote := testrepo.Must(t, fx.bare, "rev-parse", "refs/heads/"+b.Name)
+	if local, _ := fx.dev.RevParse(b.Name); local != remote {
+		t.Fatal("local branch did not take GitHub's restack")
+	}
+	testrepo.Must(t, fx.dev, "checkout", "-q", b.Name)
+	testrepo.Commit(t, fx.dev, "follow-up", map[string]string{"internal/types/extra.go": "package types\n"})
+	testrepo.Must(t, fx.dev, "checkout", "-q", "feature")
+	if err := stack.Sync(fx.dev, fx.s, stack.SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stack.Push(fx.dev, fx.f, fx.s, stack.PushOptions{}); err != nil {
+		t.Fatalf("a follow-up push after GitHub's restack must work: %v", err)
+	}
+}
+
+// With the built-in token no "PR merged" run starts, so the next tick's
+// FinishLanded must land the next part of an incremental stack itself.
+func TestATickLandsTheNextPartOfAnIncrementalStack(t *testing.T) {
+	fx := setup(t)
+	if err := (&land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin"}).Land(prBy(t, fx, 0).Number); err != nil {
+		t.Fatal(err)
+	}
+	fx.landQueue(t, "rebase")
+	if err := fx.ci(t).FinishLanded(); err != nil {
+		t.Fatal(err)
+	}
+	if len(fx.f.Merges) != 2 || fx.f.Merges[1] != prBy(t, fx, 1).Number {
+		t.Fatalf("the tick should land part 2: %v", fx.f.Merges)
+	}
+	if err := fx.ci(t).FinishLanded(); err != nil || len(fx.f.Merges) != 2 {
+		t.Fatalf("and only once: %v %v", err, fx.f.Merges)
 	}
 }

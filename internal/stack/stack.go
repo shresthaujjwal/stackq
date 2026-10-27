@@ -33,8 +33,8 @@ type Stack struct {
 	Name   string `json:"name"`
 	Trunk  string `json:"trunk"`
 	Remote string `json:"remote,omitempty"`
-	// Landing is "atomic" (the whole stack is one merge-queue entry) or
-	// "incremental" (one PR at a time). Empty means incremental.
+	// Landing is "atomic" (GitHub merges the whole stack as one request) or
+	// "incremental" (one part at a time). Empty means incremental.
 	Landing string `json:"landing,omitempty"`
 	Source  string `json:"source,omitempty"`
 	// SourcePR is the original big PR, if there is one.

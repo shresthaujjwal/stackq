@@ -1,6 +1,6 @@
 # stackq: design and technical specification
 
-Status: v0 prototype, built 2026-10-15. Single-author handoff document.
+Status: v0 prototype, built 2026-10-15; redesigned on GitHub's stacked pull requests 2026-10-27 (§14). Single-author handoff document.
 Audience: you, picking this up on a laptop with no other context.
 
 This document describes what stackq is, why it is shaped the way it is, exactly how every part works today, what is known to be missing or wrong, and what to do next. Where the code and this document disagree, the code wins. Please fix this document when you notice.
@@ -22,7 +22,7 @@ This document describes what stackq is, why it is shaped the way it is, exactly 
 11. [Sync algorithm](#11-sync-algorithm)
 12. [Push algorithm](#12-push-algorithm)
 13. [PR body format and the marker protocol](#13-pr-body-format-and-the-marker-protocol)
-14. [Merge queue integration](#14-merge-queue-integration)
+14. [GitHub stacks and the merge](#14-github-stacks-and-the-merge)
 15. [CI / GitHub Action](#15-ci--github-action)
 16. [GitHub API surface (forge layer)](#16-github-api-surface-forge-layer)
 17. [git layer](#17-git-layer)
@@ -50,8 +50,8 @@ This document describes what stackq is, why it is shaped the way it is, exactly 
 stackq is a Go CLI plus a composite GitHub Action. It has five jobs.
 
 1. **Split.** It takes one large branch and produces an ordered stack of small branches, each holding one commit. The order follows the import graph, so every slice can build on its own. The top of the stack is byte-for-byte identical to the original branch.
-2. **Maintain.** It keeps the stack consistent while people review it. You edit a lower branch and everything above is rebased, replaying only each branch's own commits. PRs are opened with the right bases, and every PR body carries a live overview of the whole stack.
-3. **Land.** It lands the stack through GitHub's native merge queue. By default the landing is **atomic** (§28): every part is reviewed and checked on its own, then the whole stack goes into the queue as one entry, so trunk gets all of it or none of it, and one revert undoes all of it. An **incremental** mode lands one PR at a time instead. In that mode, when a PR merges, CI restacks the next PR onto trunk, retargets it, pushes it, and queues it. Conflicts and dequeues pause the stack with a comment and a label.
+2. **Maintain.** It opens the PRs with the right bases and links them as one **GitHub stack** (GitHub's own stacked pull requests, §14). GitHub then shows the stack on every PR, enforces trunk's rules and CI on each, and rebases and retargets the PRs above a merge itself. Locally, you edit a lower branch and `stackq sync` rebases everything above it, replaying only each branch's own commits; every PR body carries a live overview of the whole stack.
+3. **Land.** It decides when a stack lands and asks GitHub to do it. By default the landing is **atomic** (§28): every part is reviewed and checked on its own, then stackq asks GitHub to merge the top part, which in a GitHub stack merges every part below it too, bottom up, as one all-or-nothing request through the merge queue. Trunk gets all of it or none of it, and one revert undoes all of it. An **incremental** mode lands one part at a time instead; GitHub moves the next part onto trunk after each merge. A merge request GitHub turns down, or a dequeue, pauses the stack with a comment and a label.
 4. **Ship safely behind flags.** When the repo's flag layout is configured (§29), flag definitions land first. The code that switches the feature on is held back in a separate activation PR that is never queued automatically, and entrypoints added outside a flag check are reported.
 5. **Prioritize the queue.** With `priority` configured (§31), PRs wait in a labeled pool and stackq feeds GitHub's FIFO queue best-first: vulnerability fixes and reverts jump the queue within a small budget, bot/automerge and small PRs go ahead of large ones, and waiting time ages every PR up so nothing starves.
 
@@ -60,10 +60,11 @@ Locked-in decisions from the planning conversation:
 | Decision | Choice |
 |---|---|
 | Merge queue | GitHub native merge queue |
+| Stacks | GitHub's own stacked pull requests: stackq links its PRs as a GitHub stack and lands with GitHub's merge of the stack. stackq's own retarget-and-restack landing was removed (redesign 2026-10-27, §14) |
 | Form factor | Go CLI + GitHub Action |
 | Merge method assumed | Rebase. CI works with any method; local sync detection needs rebase or merge (§24). |
-| Scope | Auto-split, create/sync stack, enqueue and restack, conflict/CI handling |
-| Landing | Atomic by default (one queue entry, one revert); incremental available (added 2026-10-16) |
+| Scope | Auto-split, create/sync the stack, link it as a GitHub stack, decide when it lands, priority, revert |
+| Landing | Atomic by default (GitHub merges the whole stack as one request, one revert); incremental available (added 2026-10-16; both on GitHub stacks since 2026-10-27) |
 | Flags | Flag definitions first; activation held in a hand-merged PR (added 2026-10-16) |
 | Priority | Pool + admission control on GitHub's FIFO queue; jumps only for urgent PRs, bounded (added 2026-10-16) |
 
@@ -82,7 +83,7 @@ Stacking has two well-known pain points, and a merge queue adds a third.
    - With the rebase or squash method, a merged PR's commits land on trunk with **new SHAs**. The next PR in the stack still contains the old SHAs. Retargeting it to trunk without a rebase shows the parent's changes again in the diff, and often conflicts.
    - GitHub's "automatically delete head branches" setting retargets child PRs to trunk when the parent branch is deleted. This makes the retarget happen, but it does not perform the rebase, so the diff is wrong until someone fixes it.
 
-stackq automates all three.
+stackq automated all three. Since GitHub added stacked pull requests (2026), GitHub itself handles the third, and the restack after a merge: stackq now links its stacks as GitHub stacks and lets GitHub merge them (§14).
 
 ---
 
@@ -131,7 +132,9 @@ stackq automates all three.
 | **Marker** | Hidden JSON in the PR body: `<!-- stackq:meta {...} -->`. |
 | **Managed block** | The region of the PR body between `<!-- stackq:begin -->` and `<!-- stackq:end -->`. stackq owns it; everything else belongs to the author. |
 | **Restack** | Rebasing a branch onto its parent's new tip, replaying only its own commits. |
-| **Land** | Put a PR into the merge queue, or enable auto-merge so it joins once checks pass. |
+| **GitHub stack** | GitHub's own record that a chain of PRs is a stack (stacked pull requests, §14). |
+| **Lander** | The top part of an atomic stack (the highest one that isn't held). Asking GitHub to merge it merges the whole stack. |
+| **Land** | Ask GitHub to merge a PR, and in a GitHub stack every open PR below it, through the merge queue when trunk has one. |
 
 ---
 
@@ -167,7 +170,7 @@ If the feature is behind a flag, turn the flag off first; it's faster and needs 
 git checkout stack/big-refactor/02-internal-types
 # edit, commit (new commits or amend — both work)
 stackq sync      # rebases 03.. onto the new 02, replaying only their own commits
-stackq push      # lease-protected push, retargets and refreshes PR bodies
+stackq push      # lease-protected push, keeps the GitHub stack and PR bodies current
 ```
 
 ### 5.3 Picking up after CI restacked
@@ -222,13 +225,12 @@ flowchart LR
   CLI -- plan/split/sync --> WT
   CLI <--> State
   CLI -- push (lease) --> Remote
-  CLI -- create/edit PRs, enqueue --> PRs
+  CLI -- create/edit PRs, link GitHub stack, merge request --> PRs
   PRs --> MQ
-  MQ -- merges PR --> Remote
+  MQ -- merges the stack --> Remote
   MQ -- "pull_request closed/dequeued" --> GHA
   GHA -- reads markers --> PRs
-  GHA -- rebase + lease push --> Remote
-  GHA -- retarget, refresh, enqueue --> PRs
+  GHA -- gate, merge request, finish --> PRs
 ```
 
 Three layers:
@@ -266,7 +268,7 @@ stackq/
 │   │   ├── body.go              marker + managed block render/parse/merge
 │   │   └── stack_test.go
 │   ├── land/
-│   │   ├── land.go              Land (atomic/incremental), AfterMerge, finishAtomic, cascade, Dequeued
+│   │   ├── land.go              Land/AutoLand (atomic/incremental via GitHub stacks), merge requests, FinishLanded, Dequeued
 │   │   ├── revert.go            Revert: identify landed commits per merge method, integrity check, revert PR
 │   │   ├── schedule.go          priority pass: pool → eligibility → rank → jump/admit; job summary
 │   │   └── land_test.go
@@ -524,7 +526,7 @@ For each active branch with a remote-tracking ref `<remote>/<name>`, compare the
 |---|---|
 | Local branch missing | Create it at `rs`; set `PushedSHA = rs`. |
 | `rs == ls`, or `PushedSHA == ""`, or `rs == PushedSHA` | Nothing: in sync, never pushed by stackq, or only local moved. |
-| `ls == PushedSHA` (only remote moved) | `ResetBranch(name, rs)`; set `PushedSHA = rs`; log "took the version CI restacked". |
+| `ls == PushedSHA` (only remote moved) | `ResetBranch(name, rs)`; set `PushedSHA = rs`; log "took the version CI restacked". With GitHub stacks the remote moves when GitHub rebases the stack (after a merge, or **Rebase stack**). |
 | Otherwise (both moved) | Error asking you to reconcile by hand. |
 
 `ResetBranch` uses `git reset --hard` inside the worktree that has the branch checked out, but only if that worktree is clean. Otherwise it uses `git branch --force`.
@@ -574,9 +576,10 @@ Entry point: `stack.Push(repo, forge, stack, PushOptions{Draft})`.
 3. For each active branch, open or retarget its PR:
    - `FindOpenPRByHead(name)`.
    - If there is none, `CreatePR(head=name, base=parent, title=branch.Title, body=RenderBlock(marker, nav), draft)` and record `pr`.
-   - If there is one, record its number. If its base differs from the parent, `EditPR(base=parent)`.
-4. Refresh bodies. For each active branch, `GetPR` and compute `MergeBody(existing, RenderBlock(...))`; edit only if it changed. This second pass exists because PR numbers for later branches don't exist yet when earlier ones are created.
-5. Link the original PR (§12.1).
+   - If there is one, record its number. If its base differs from the parent, `EditPR(base=parent)`, unless the PR is in a GitHub stack: GitHub sets the bases of stacked PRs and refuses changes ("Cannot change the base branch because the pull request is part of a stack", seen live), so stackq logs the difference and leaves it.
+4. **Link the GitHub stack** (`LinkGitHubStack`). The stack's open PRs, bottom first, become one GitHub stack (`POST /repos/{owner}/{repo}/stacks`; each PR's base must be the head branch of the one before, which stackq's chain guarantees). If some are already in a stack, the missing ones must be on top and are added (`POST …/stacks/{n}/add`); PRs in more than one stack, or a gap, are an error that says to unstack on GitHub. One open PR needs no stack (GitHub stacks need two). A failure here fails the push after the PRs exist, so the next push retries.
+5. Refresh bodies. For each active branch, `GetPR` and compute `MergeBody(existing, RenderBlock(...))`; edit only if it changed. This second pass exists because PR numbers for later branches don't exist yet when earlier ones are created.
+6. Link the original PR (§12.1).
 
 Titles are set only at creation. User edits to titles are never overwritten.
 
@@ -601,7 +604,7 @@ The big branch usually already has a PR. stackq links the stack to it so reviewe
 3. **Every PR's managed block** says "Split from #97." via the marker's `source` field (§13).
 4. **Link comment, once.** If `sourceNotified` is false, stackq comments on the original PR with a numbered list of every stack PR and branch, then sets `sourceNotified`. Re-running push never duplicates the comment.
 5. **Close (opt-in).** With `--close-source` or config `closeSource: true`, the original PR is closed if it's still open. The comment then says it was closed in favor of the stack. Closing is reversible on GitHub, and the original branch is not deleted.
-6. **Landed note (CI).** When `after-merge` handles a PR with no children, and every stack PR (by marker `total`) is merged, CI comments on the original PR: "✅ Stack `<name>` has fully landed on `main`", with the list of PRs. This needs the marker's `source` field, so it works without local state.
+6. **Landed note (CI).** When every part of the stack has merged, the run that finishes the landing (§14.3) comments on the original PR: "✅ Stack `<name>` has landed on `main`", with the list of PRs and any activation PR still waiting. This needs the marker's `source` field, so it works without local state.
 
 Recommendation: use `--close-source`. Leaving the original open risks someone merging it alongside the stack, which conflicts with every slice.
 
@@ -629,7 +632,7 @@ Recommendation: use `--close-source`. Leaving the original open risks someone me
 
 - **Marker parsing.** The parser uses the regex `<!-- stackq:meta (\{[^\n]*?\}) -->` and JSON-decodes the capture. It requires a non-empty `stack`.
 - **Merging.** `MergeBody(existing, block)` replaces the text from the first `stackq:begin` to the first `stackq:end`. If either marker is missing, it appends the block after a blank line, or uses the block alone if the body is empty. Author text before and after the block is preserved byte-for-byte.
-- **Parent field.** The marker's `parent` is the **head branch name** of the parent PR, or the trunk. CI finds children by matching `marker.parent == mergedPR.headRefName`. It deliberately does not use `baseRefName`, because GitHub may already have retargeted the child to trunk when the parent branch was auto-deleted.
+- **Parent field.** The marker's `parent` is the **head branch name** of the parent PR, or the trunk. stackq orders a stack's PRs by marker index and never relies on `baseRefName`, because GitHub retargets stacked PRs itself after a merge.
 - **Index and total.** These are positions in the original stack and never change.
 - **Nav entries.** Each entry comes from all stack PRs, open or merged; closed-unmerged PRs are excluded. ✅ means merged.
 
@@ -639,17 +642,33 @@ Treat the marker JSON as a public format. Add fields freely, but never rename or
 
 ---
 
-## 14. Merge queue integration
+## 14. GitHub stacks and the merge
 
-### 14.1 Constraints of GitHub's native queue (as understood when designing)
+**Redesign (2026-10-27).** stackq used to land stacks with its own machinery: atomic landing retargeted the top PR to trunk and queued it as one entry, and after every merge CI rebased, pushed and retargeted the PRs above it (`cascade`, `AfterMerge` restacks), closed the parts that landed inside the lander, fell back to auto-merge when the queue refused, and asked part approvers to review the lander. GitHub's own stacked pull requests (public preview since 2026-07) now do all of that natively, and stackq uses them instead. That code was removed. What stackq still decides is *when* a stack lands, and *what* lands (the split, the held activation PR, priority).
 
-- Only PRs whose base is the queue-protected branch can be enqueued.
-- The queue builds temporary `gh-readonly-queue/<base>/…` branches and runs workflows on the `merge_group` event. Workflows without `merge_group` never report, and the queue stalls.
-- The merge method (merge, rebase or squash) is configured on the queue itself, not per PR.
-- `enqueuePullRequest` (GraphQL) adds a PR directly. It can fail if requirements such as checks or approvals aren't met yet.
-- `enablePullRequestAutoMerge` on a queue-protected base means "add to the queue once requirements are met".
-- `pull_request` events have `enqueued` and `dequeued` activity types; `closed` with `merged == true` fires when the queue merges.
-- Pushes made with the workflow's `GITHUB_TOKEN` do not trigger other workflows.
+### 14.1 What GitHub stacks provide
+
+From GitHub's documentation ([about stacked PRs](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs), [merging stacked PRs](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/merging-stacked-pull-requests), [APIs and webhooks](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)):
+
+- **A stack** is two or more PRs in one repository whose bases chain: the bottom targets trunk, each other PR targets the head branch of the one below. Every PR shows the stack map. No forks, no branching.
+- **Rules and CI** are those of the stack's base (trunk) for every PR in it: required reviews, CODEOWNERS and required checks apply to mid-stack PRs too, and `pull_request` workflows for trunk run for every PR in the stack.
+- **Merging** a PR merges it together with every open PR below it, bottom up, as one request: all of them merge (or join the merge queue), or none. The history is the same as merging each PR on its own, so every part becomes a merged PR with its own commits on trunk. Merge, squash and rebase all work. PRs above the merged one stay open and are rebased and retargeted onto trunk by GitHub.
+- **The merge queue** is stack aware: the PRs join in order, a merge group may exceed its size by 50 % to keep a stack together, and a PR ejected from the queue takes the PRs above it out too.
+- **Rebasing** after a lower branch changes or trunk moves is a server-side **Rebase stack** button; it keeps approvals when a diff did not change.
+- **API.** REST: `GET/POST /repos/{o}/{r}/stacks`, `GET …/stacks/{n}`, `POST …/stacks/{n}/add`, `POST …/stacks/{n}/unstack`, and a `stack` object (`number`, `size`, `position`, `base`) on every PR. Merging a stacked PR requires the asynchronous merge API, `PUT /repos/{o}/{r}/pulls/{n}/merge-async` (`merge_action`: `default` | `merge_queue` | `direct_merge`, optional expected head `sha`), which answers with a `status` of `pending` (with a uuid to poll at `GET …/merge-async/{uuid}`), `enqueued`, `merged` or `failed` (with GitHub's message). Rules are evaluated when the merge runs, so a rule failure arrives as `failed`. The legacy merge endpoints, `enqueuePullRequest` and auto-merge do not work on stacked PRs. GraphQL is read-only for stacks. API version `2026-03-10`.
+
+**Seen live in the sandbox repo (2026-10-27):**
+
+| Finding | Result |
+|---|---|
+| The Stacks API is available on the repo with no setup | `GET …/stacks` answered `[]`; PRs carry `"stack": null` |
+| Create a stack from three chained PRs (user token) | stack #106 |
+| **Change the base of a stacked PR** (what atomic landing used to do) | **refused**: "Cannot change the base branch because the pull request is part of a stack" |
+| Force-push a rebased branch of a stacked PR | accepted; the PR stays in the stack |
+| Add a draft PR on top of a stack | accepted (the activation PR is a draft) |
+| **The built-in `GITHUB_TOKEN` creates a stack** (inside a workflow) | **yes**: stack #111 |
+
+**Not yet seen live:** a merge through `merge-async` (merging into the sandbox's trunk needs the owner's go-ahead), its answers and their timing, how the queue reports a stack's entries, whether a `merge-async` request made with the built-in token behaves like one made by a person, and how long after a merge GitHub retargets the PRs above. Until then the behaviour in §14.2–§14.4 follows GitHub's documentation and the fake (§16.3), which mirrors it.
 
 ### 14.2 Landing sequence
 
@@ -660,67 +679,56 @@ sequenceDiagram
   participant MQ as Merge queue
   participant A as stackq Action
   Dev->>GH: stackq push (PRs #1..#4, bases chained)
-  Dev->>MQ: stackq land (#1, base=main)
-  MQ->>GH: merge #1 (rebase → new SHAs on main)
-  GH-->>A: pull_request closed, merged=true (#1)
-  A->>GH: list PRs, parse markers, find child(ren) of #1's head
-  A->>A: fetch main + child; rebase --onto main <#1 headRefOid> child
-  A->>GH: push --force-with-lease child
-  A->>GH: edit #2: base=main, body (parent=main, nav ✅#1)
-  A->>MQ: enqueue #2 (or enable auto-merge)
-  Note over GH,MQ: #2's checks run on the new head (App token), then the queue runs merge_group
-  MQ->>GH: merge #2 … repeat until the top
+  GH-->>Dev: linked as GitHub stack S
+  A->>A: tick: every part approved + green
+  A->>GH: PUT pulls/#3/merge-async (merge_action=default, sha=#3 head)
+  GH-->>A: pending, uuid U (recorded in #3's status)
+  GH->>MQ: #1, #2, #3 join in order, one merge group
+  MQ->>GH: merge #1, #2, #3 (each with its own commits)
+  GH->>GH: rebase + retarget #4 (activation) onto main
+  A->>A: next tick: FinishLanded sees #3 merged with a request
+  A->>GH: labels/status ✅, activation comment, note on the original PR
 ```
 
-### 14.3 `AfterMerge(n)` in detail (`internal/land/land.go`)
+### 14.3 After a merge (`FinishLanded`, `AfterMerge`)
 
-1. Run `GetPR(n)`. If it is not merged, or has no marker, log and return nil. A stray event is a no-op.
-2. **Stack PRs.** Use `ListPRs("all")` (open + recent merged), keep PRs whose marker has the same stack name, and sort by marker index. Force the merged PR's state to MERGED, in case the listing lags.
-3. **Children.** Children are the open stack PRs with `marker.parent == pr.HeadRef`. If there are none, refresh the navs and return.
-4. **Fetch.** `git fetch <remote> +refs/heads/<trunk>:refs/remotes/<remote>/<trunk>`, plus every child's head ref the same way. Set `onto = rev(<remote>/<trunk>)`.
-5. **For each child:**
-   1. `old = rev(<remote>/<child>)`.
-   2. `upstream = pr.HeadSHA` if it is an ancestor of `old`, else `""`. `pr.HeadSHA` is the parent's pre-merge head. Its commits are in the child's history, so the object is available even if the parent branch was deleted.
-   3. `newSHA = RebaseCommit(old, onto, upstream)`, a detached rebase in a temporary worktree.
-   4. **On conflict:** comment with the file list and recovery steps, add the `stackq:conflict` label, record the failure, and continue with the other children. Nothing is pushed.
-   5. If `newSHA != old`: `push --force-with-lease=refs/heads/<child>:<old>`. A push error aborts the whole run.
-   6. Update the marker (`parent = trunk`) and re-render the body, then `EditPR(base=trunk, body)`.
-   7. If `Enqueue` is set: `Enqueue(child)` with the expected head OID `newSHA`. On error, comment, add the `stackq:blocked` label, and record the failure.
-6. Refresh the nav on all other open stack PRs. If the merged PR had no children, and every stack PR is now merged and the marker has a `source`, comment the landed note on the original PR (§12.1, step 6).
-7. If anything failed, return `"stack <name> paused at #X, #Y"`, and the workflow run turns red.
+GitHub does the git work; stackq only reports. Merges made by the queue for the built-in token start no "PR merged" workflow (§15.3a), so every `tick` runs `FinishLanded`, and the `after-merge` event (when it does fire) runs the same code for one stack:
 
-### 14.4 Why not queue every stack PR at once
+1. **Which stacks.** A stack still to finish has a merged PR whose status section carries the merge request tag (`<!-- stackq:merge-request <uuid> -->`, §14.4). Finished stacks have none, so this is idempotent.
+2. **For every merged PR** of the stack: remove `stackq:landing` and `stackq:blocked`. For the PR the request was made for (the top part, or the part an incremental landing asked for), replace the status with "✅ Landed on `main`", the trunk commit and the rollback command.
+3. **Refresh the nav** on the open PRs.
+4. **When every part has merged:** label the held PR(s) `stackq:activation` and comment that GitHub has moved them onto trunk and stackq will not merge them, and comment on the original PR (§12.1). The parts are *merged* PRs now, not closed ones, so revert finds each part's commits (§28.5).
+5. **Incremental stacks** (with `Enqueue`, the `ci` default): finishing a merge lands the next part (§28.2), whether the merge was noticed by `after-merge` or by a tick's `FinishLanded`, since a queue merge made for the built-in token starts no "PR merged" run.
 
-Note: this section explains why stackq does **not** retarget and enqueue every stack PR separately. Atomic mode (§28) avoids all three problems differently: it queues **one** entry, the top PR, which already contains every part.
+### 14.4 Following a merge request
 
-Option considered: retarget every stack PR to trunk and enqueue them all at once. The queue would test `main + #1`, `main + #1 + #2`, and so on, which gives faster throughput.
+`Runner.merge` calls `Forge.Merge(n, head)`. A `failed` answer pauses the stack at once (comment, `stackq:blocked`, status ⏸ with GitHub's message). Otherwise the status section gets 🚀 *Landing* and the request tag with the uuid (or `-` when GitHub answered without one, e.g. "already in the merge queue"). Every later run asks `landingState`:
 
-It was rejected because:
-- With the rebase or squash method, the queue applies #2's commits, which include #1's original commits, on top of `main + #1'`. Whether that applies cleanly depends on GitHub's internal rebase. Identical patches usually collapse, but anything touching the same lines can conflict or double-apply. This is not verifiable offline.
-- While queued, each retargeted PR's diff shows all lower slices' changes, which defeats reviewability.
-- A failure in #k ejects #k and every entry after it, so you restack anyway.
+| Found | State | stackq does |
+|---|---|---|
+| the pool label | `pool` | waits |
+| no request tag | `idle` | gates and lands |
+| PR in the merge queue | `queued` | waits |
+| request `pending` | `pending` | waits |
+| request `failed` | `failed` | pauses with GitHub's message (automatic runs); `stackq land` asks again |
+| request `merged`, or the PR merged meanwhile, or a lookup failed | `unknown` | waits (the merge is finished by §14.3) |
+| none of the above, PR still open | `gone` | it left the queue unhandled: pause like `dequeued` (§28.4) |
 
-Incremental landing costs one queue cycle per slice. Atomic landing costs one queue cycle for the whole stack.
+`stackq land` by hand on a paused stack makes a new request and clears the pause.
 
-### 14.5 Enqueue fallback logic (`GH.Enqueue`)
+### 14.5 Jump and enqueue errors (`GH.Jump`)
 
-1. If `NodeID` is missing, fetch it.
-2. Try `enqueuePullRequest(pullRequestId, expectedHeadOid)`.
-3. Classify the error by GitHub's wording. These are final, because auto-merge would hit the same wall (or, for a moved head, would skip the head check), so Enqueue returns an `EnqueueError` and does not try auto-merge. The wording was recorded from real runs on 2026-10-26:
+The asynchronous merge API has no "jump to the front", and GitHub stacks cannot be queued any other way, so a jump (§31) applies only to PRs outside a stack, such as a revert. `GH.Jump` uses the GraphQL `enqueuePullRequest(…, jump: true)` mutation with the expected head. Its refusals are classified by GitHub's wording (recorded from real runs on 2026-10-26) into an `EnqueueError` that says what to do:
 
-   | GitHub says | Kind | Meaning |
-   |---|---|---|
-   | `Pull request is closed` (auto-merge: `... is already merged`) | closed | merged or closed already |
-   | `Pull request is in draft` (auto-merge: `... is a draft`) | draft | mark it ready for review |
-   | `... expected head oid does not match the current head oid` | stale | the PR changed since it was checked; the next run looks again |
-   | `Could not resolve to a node ...` | missing | the PR is gone |
-   | `Resource not accessible by integration` | forbidden | the token lacks `contents: write` / `pull-requests: write`; use an App or PAT token |
+| GitHub says | Kind | Meaning |
+|---|---|---|
+| `Pull request is closed` | closed | merged or closed already |
+| `Pull request is in draft` | draft | mark it ready for review |
+| `... expected head oid does not match the current head oid` | stale | the PR changed since it was checked |
+| `Could not resolve to a node ...` | missing | the PR is gone |
+| `Resource not accessible by integration` | forbidden | the token lacks `contents: write` / `pull-requests: write` |
 
-   The error says what to do and quotes GitHub; it reaches the PR as a comment or the `stackq:blocked` label as before. A `jump` refused for one of these reasons is not retried without the jump.
-4. On any other error (typically required checks still running), try `enablePullRequestAutoMerge(pullRequestId)` with no merge method; the queue decides the method.
-5. If both fail, return a combined error.
-
-`expectedHeadOid` protects against queueing a head that changed after the restack.
+A final refusal is not retried; any other refused jump falls back to a normal merge request.
 
 ---
 
@@ -778,7 +786,7 @@ Every push to `main` (a merged PR) that changes more than Markdown files is test
 | same | anything else | no-op, exit 0 |
 | `pull_request_review`, `workflow_run`, `check_suite`, `schedule` | `autoLand` or the priority pool is on | `tick` (otherwise no-op) |
 
-`tick` does these in order: `FinishLanded` (tidy stacks whose lander merged without the cleanup running, see below), `AutoLand` (if `autoLand` is on), then the priority pass (if the pool is on), the activation reminders (§28.7), and `TidyStackBranches`.
+`tick` does these in order: `FinishLanded` (finish stacks GitHub has merged, §14.3), `AutoLand` (if `autoLand` is on), then the priority pass (if the pool is on), the activation reminders (§28.7), and `TidyStackBranches`.
 
 **What wakes stackq.** Each step of a landing is started by an event; the cron is not relied on.
 
@@ -789,7 +797,8 @@ Every push to `main` (a merged PR) that changes more than Markdown files is test
 | CI on stack branches | the `stackq` run after the split, through `workflow_dispatch` |
 | Auto-land once parts are green or approved | `workflow_run` (CI finished on a part), `pull_request_review` |
 | Pool admission | the same run that adds the pool label, and every later `tick` |
-| Cleanup after the queue merges | `workflow_run` for CI on the push to trunk (needs CI to run on `push` to trunk, as `examples/ci-merge-group.yml` does) |
+| Finishing after GitHub merges | `workflow_run` for CI on the push to trunk (needs CI to run on `push` to trunk, as `examples/ci-merge-group.yml` does) |
+| The next part of an incremental stack | the same run (`FinishLanded`, then `AutoLand`), or `after-merge` when that event fires |
 | Pausing a stack the queue rejected | `pull_request` dequeued, and every `tick` as a fallback (§28.4) |
 
 The 5-minute `schedule` is a safety net only: GitHub runs schedules late or skips them under load. In the sandbox repo it fired about every two hours (2026-10-24/25).
@@ -800,24 +809,22 @@ The 5-minute `schedule` is a safety net only: GitHub runs schedules late or skip
 
 You can also call the steps directly: `stackq ci after-merge|dequeued|land --pr N [--no-enqueue]`.
 
-If git `user.email` is unset, `ci` injects `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` as github-actions[bot]. Rebases preserve the original author.
+If git `user.email` is unset, `ci` injects `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` as github-actions[bot].
 
 ### 15.3a Why `tick` also finishes landed stacks
 
-GitHub does not start workflows for events caused by the built-in `GITHUB_TOKEN`. When stackq itself queued the lander with that token, the later `merged` and `closed` events are attributed to `github-actions[bot]` (seen on a live run), so the "closed and merged" trigger, and with it `after-merge`, never fires. The parts stay open and the held activation PR keeps pointing at a branch that is gone.
+GitHub does not start workflows for events caused by the built-in `GITHUB_TOKEN`. When stackq asked for the merge with that token, the later `merged` and `closed` events are attributed to `github-actions[bot]` (seen on a live run before GitHub stacks), so the "closed and merged" trigger, and with it `after-merge`, never fires. So every `tick` runs `FinishLanded` (§14.3), which finds merged PRs that still carry a merge request tag and finishes their stacks; a finished stack is left alone.
 
-`Runner.FinishLanded` closes that gap. For every open atomic stack whose lander is merged it checks for leftovers: a part that is still open, or the held PR still targeting a stack branch. If there are any it runs `AfterMerge(lander)`, which is idempotent. A held PR that could not be rebased (labeled `stackq:conflict`) is skipped, so a conflict is reported once, not every tick. A tidy stack is left alone.
-
-`FinishLanded` only sees stacks that still have an open PR. A stack of one part has none once the queue merges it, and that merge starts no "PR merged" run for the built-in token, so its branch used to stay (seen live, 2026-10-26: `stack/ping/01-...`). `Runner.TidyStackBranches` closes that gap: every tick it runs the `gc` rules (§18) restricted to the branches stackq itself makes (stack and revert branches), with deletion on, and says nothing when there is nothing to delete. `keepBranches` turns it off.
+`Runner.TidyStackBranches` also runs every tick: the `gc` rules (§18) restricted to the branches stackq itself makes (stack and revert branches), with deletion on, quiet when there is nothing to delete. `keepBranches` turns it off. (Seen live 2026-10-26: a one-part stack's branch stayed after the queue merged it.)
 
 **With the built-in token, also note:** the merge queue does not run `merge_group` workflows for entries that token added (the sandbox repo has none), so the queue merges without CI on the merged result. A GitHub App or PAT (`STACKQ_TOKEN`) avoids both this and the missing cleanup trigger.
 
-**Required checks (tested live 2026-10-25).** With `test` required on trunk and the built-in token, a stack cannot land:
+**Required checks (tested live 2026-10-25, before GitHub stacks; the token rule behind it still applies).** With `test` required on trunk and the built-in token, a stack cannot land:
 
 1. The lander's head had a passing `test` from the CI stackq starts with `workflow_dispatch`, yet GitHub refused `enqueuePullRequest` with `Required status check "test" is expected`, and stackq fell back to auto-merge. The PR became mergeable only after a person approved the PR's own `pull_request` CI run, which GitHub holds as `action_required` for PRs the built-in token opens.
 2. Once enqueued, the queue created `gh-readonly-queue/<trunk>/pr-<n>-…`. A dispatched CI run on that commit passed and reported `test` from the same app (GitHub Actions, id 15368), yet the entry stayed `AWAITING_CHECKS` for 20+ minutes. It merged within seconds of the requirement being removed.
 
-The check name and source were identical in every case; only the triggering event differed. A required check is met only by runs started by a pull request or the merge queue, so a `workflow_dispatch` run on the right commit does not count. Nothing the built-in token can start has that event. Starting CI on the queue's branch (tried as `queueCI`, removed again) therefore does not help, and posting the result as a status or check run would be the workflow vouching for itself, so it is not done. Use a GitHub App or PAT as `STACKQ_TOKEN` for required checks, or leave them off. `stackq doctor` reports both setups, and the lander's description says when it is waiting for GitHub's requirements.
+The check name and source were identical in every case; only the triggering event differed. A required check is met only by runs started by a pull request or the merge queue, so a `workflow_dispatch` run on the right commit does not count. Nothing the built-in token can start has that event. Starting CI on the queue's branch (tried as `queueCI`, removed again) therefore does not help, and posting the result as a status or check run would be the workflow vouching for itself, so it is not done. Use a GitHub App or PAT as `STACKQ_TOKEN` for required checks, or leave them off. `stackq doctor` reports both setups. With GitHub stacks the merge request carries GitHub's verdict: a missing required check should come back as a `failed` request, which pauses the stack with GitHub's message (expected from the docs, not yet seen live).
 
 ### 15.4 Required repository settings
 
@@ -826,8 +833,8 @@ The check name and source were identical in every case; only the triggering even
 - **Token:**
   - **GitHub App** (preferred): Contents read/write, Pull requests read/write, and Metadata read. Install it on the repo, then store `vars.STACKQ_APP_ID` and `secrets.STACKQ_APP_KEY`.
   - **Fine-grained PAT** (alternative): the same scopes.
-- **Auto-merge:** enable "Allow auto-merge" in the repository settings, or the auto-merge fallback fails.
-- **Delete head branches:** optional. stackq works either way, because it matches children by marker, not by base.
+- **GitHub stacks:** available on github.com with no setup (public preview); `stackq doctor` checks the API answers. Auto-merge is not needed (GitHub stacks don't support it).
+- **Delete head branches:** optional. stackq works either way, because it matches PRs by marker, not by base, and tidies its own branches (§15.3a).
 
 ---
 
@@ -837,16 +844,22 @@ The check name and source were identical in every case; only the triggering even
 
 ```go
 type Forge interface {
-  ListPRs(state string) ([]PR, error)          // "open" | "all" (open + recent merged)
+  ListPRs(state string) ([]PR, error)          // "open" | "all" (open + recent merged) | "closed"
   GetPR(n int) (PR, error)
   Details(n int) (Details, error)              // latest reviews, check rollup, merge commit, commit count
   FindOpenPRByHead(head string) (*PR, error)
   CreatePR(head, base, title, body string, draft bool) (PR, error)
-  EditPR(n int, base, body *string) error      // nil = leave unchanged
-  Enqueue(pr PR, o EnqueueOptions) error        // o.Jump → front of the queue
+  EditPR(n int, base, body *string) error      // nil = leave unchanged; GitHub refuses a base change on a stacked PR
+  Merge(n int, headSHA string) (MergeRequest, error)      // asynchronous merge: the PR and, in a stack, every open PR below it
+  MergeResult(n int, uuid string) (MergeRequest, error)   // pending | enqueued | merged | failed, with GitHub's message
+  Jump(pr PR) error                                       // front of the queue; PRs outside a stack only
+  StackOf(n int) (int, error)                  // GitHub stack number, or 0
+  StackPRs(s int) ([]int, error)               // bottom first
+  CreateStack(prs []int) (int, error)          // bottom first, bases chained
+  AddToStack(s int, prs []int) error           // on top
   ListPool(label string) ([]PR, error)          // open PRs with the pool label, with size/author/labels
   Queue(branch string) ([]QueueEntry, error)    // GitHub's merge queue, front first
-  ReadyAt(n int, label string) (time.Time, error) // when the pool label was last added
+  ReadyAt(n int, label string) (time.Time, error) // when a label was last added
   Comment(n int, body string) error
   ClosePR(n int) error
   AddLabels(n int, labels ...string) error
@@ -865,27 +878,31 @@ All calls run `gh` with `GH_REPO` set if `Repo` is set. `GH_TOKEN` comes from th
 | FindOpenPRByHead | `gh pr list --state open --head H --json …`, then filter on an exact head match |
 | CreatePR | `gh pr create --head H --base B --title T --body-file - [--draft]`; the PR number is parsed from the URL (`/pull/(\d+)`), then GetPR |
 | EditPR | `gh pr edit N [--base B] [--body-file -]` (an empty body is sent as a space) |
-| Enqueue | `gh api graphql -f query=<enqueuePullRequest> -f id=… -f oid=…`, falling back to `<enablePullRequestAutoMerge>` |
+| Merge | `gh api -X PUT -H "X-GitHub-Api-Version: 2026-03-10" repos/{owner}/{repo}/pulls/N/merge-async --input -` with `{"merge_action":"default","sha":…}`; the answer's `status` and `details` are read from the body for 202, 200, 409 and 400 alike |
+| MergeResult | `gh api … pulls/N/merge-async/UUID` |
+| StackOf | `gh api … pulls/N`, its `stack.number` |
+| StackPRs / CreateStack / AddToStack | `gh api … stacks/S`, `-X POST … stacks` and `-X POST … stacks/S/add` with `{"pull_requests":[…]}` |
 | Comment | `gh pr comment N --body-file -` |
 | ClosePR | `gh pr close N` |
-| Enqueue (jump) | `enqueuePullRequest(…, jump: true)`; a refused jump is returned so the scheduler can fall back to a normal enqueue |
+| Jump | `gh api graphql` `enqueuePullRequest(…, jump: true)`; a refused jump is classified (§14.5) and returned so the scheduler can fall back to a normal merge request |
 | ListPool | `gh pr list --label L --json …,author,labels,additions,deletions,changedFiles,isDraft,createdAt` |
 | Queue | `gh api graphql` on `repository(owner:"{owner}", name:"{repo}").mergeQueue(branch:B).entries`, with each entry's labels (to count `stackq:jumped`) |
 | ReadyAt | `gh api --paginate repos/{owner}/{repo}/issues/N/events`, latest `labeled` event for the pool label |
-| Details | `gh pr view N --json latestReviews,statusCheckRollup,mergeCommit,commits`; reviews reduce to approvers and change-requesters by latest review per author; checks roll up with `RollupChecks` |
+| Details | `gh pr view N --json latestReviews,statusCheckRollup,mergeCommit,commits,headRefOid`, plus the head commit's check runs and statuses (REST); reviews reduce to approvers and change-requesters by latest review per author; checks roll up with `RollupChecks` |
 | AddLabels | `gh label create L --color C --force` (errors ignored), then `gh pr edit N --add-label L` |
 | RemoveLabels | `gh pr edit N --remove-label L` (errors ignored) |
 
 Label colors: `stackq:conflict` is `d73a4a` (red) and `stackq:blocked` is `fbca04` (yellow).
 
-**Verified on live GitHub (2026-10-25, sandbox repo, built-in `GITHUB_TOKEN` only):** `gh pr list/view` JSON including `id` and `isCrossRepository`, label and comment writes, PR create/retarget/close, the `enqueuePullRequest` path and the resulting merge-queue entry, and `statusCheckRollup`. Not verified: the `dequeued` event and the exact `enqueuePullRequest` error text (the fallback to auto-merge now logs why it fell back). See §24, issue K0.
+**Verified on live GitHub (2026-10-25, sandbox repo, built-in `GITHUB_TOKEN` only):** `gh pr list/view` JSON including `id` and `isCrossRepository`, label and comment writes, PR create/retarget/close, the `enqueuePullRequest` path and the resulting merge-queue entry, and `statusCheckRollup`. Since then: `enqueuePullRequest` refusal wording (2026-10-26, §14.5) and the Stacks API with the built-in token (2026-10-27, §14.1). Not verified: the `dequeued` event, and `merge-async` on a GitHub stack (K14). See §24, issue K0.
 
 ### 16.3 Fake (`forge.Fake`)
 
-The fake is an in-memory map of PRs, with comments, labels and the enqueued list.
-- `HeadSHA func(branch) string` lets open PRs track the bare test origin's refs.
-- `MarkMerged(n)` freezes the head SHA and sets the state to MERGED.
-- `EnqueueErr` injects failures.
+The fake is an in-memory GitHub that behaves like GitHub stacks, so the landing tests exercise the same rules:
+- PRs, comments, labels, details, the merge queue (`MQ`) and GitHub stacks (`Stacks`, `StackBase`). `CreateStack`/`AddToStack` enforce the base chain, and `EditPR` refuses a base change on a stacked PR with GitHub's message.
+- `Merge(n)` records the request (`Merges`, `Requests` by uuid) and queues PR n and, if stacked, every open PR below it, in order; a draft or closed PR, or a moved head, gives a `failed` request. `MergePending` keeps new requests pending; tests can change a request's status.
+- `LandQueue()` merges what is queued, front first, and retargets the open PRs of a stack whose base was merged onto the stack's base; `MarkMerged(n)` does the same for one PR. The tests' `landQueue` helper also lands each PR's own commits on the bare origin with a chosen merge method.
+- `HeadSHA func(branch) string` lets open PRs track the bare test origin's refs. `MergeErr` makes `Merge` and `Jump` fail.
 
 ---
 
@@ -930,13 +947,13 @@ Stack resolution (`--stack` omitted): the stack containing the current branch, o
 |---|---|---|
 | `plan` | same as split, plus `--markdown FILE` | Prints the plan and warnings. Creates no branches. With `--markdown`, also writes the plan as a PR comment body to FILE: the `<!-- stackq:plan -->` marker, the plan in a code block and how to create the stack. The build check does not run, so a split can fold failing slices and end up with fewer PRs. |
 | `split` | `--from` (default: current branch), `--trunk`, `--name` (default: slug of the last path segment of `--from`), `--prefix`, `--max-lines`, `--check`, `--no-fold`, `--force`, `--from-pr N` (record the original PR), `--landing atomic\|incremental` (default: config, then atomic) | Plan, then Create. Refuses to run from trunk or a detached HEAD. Prints flag guard findings (§29.3). |
-| `push` | `--draft`, `--from-pr N`, `--no-source-pr`, `--close-source` | §12, §12.1 |
+| `push` | `--draft`, `--from-pr N`, `--no-source-pr`, `--close-source` | §12, §12.1; links the PRs as a GitHub stack |
 | `sync` | `--no-fetch`, `--trunk` | §11 |
-| `land` | `--pr N`, `--min-approvals N`, `--allow-unreviewed` | Atomic: gates every part and queues the lander (§28.2). Incremental: without `--pr`, the first active branch, which must have a PR and have trunk as its parent. |
+| `land` | `--pr N`, `--min-approvals N`, `--allow-unreviewed` | Atomic: gates every part, then asks GitHub to merge the top part, which merges the whole GitHub stack (§28.2). Incremental: the lowest open part, or with `--pr N` part N and every open part below it. The activation PR lands only when named. |
 | `revert` | `--pr N` (required), `--only`, `--enqueue`, `--force` | §28.5 |
 | `schedule` | `--dry-run`, `--trunk` | One priority pass (§31.5) |
 | `gc` | `--delete`, `--trunk` | List (default) or delete remote branches left behind: the head of a merged PR, a stack or revert branch whose PR was closed, the source of a finished stack. Only when no open PR uses the branch and its tip still equals its last PR's head; deleted with a lease on that tip. Also `ci gc` and the dispatch command `gc`, which delete. |
-| `doctor` | `-C` | Read-only setup check: config, merge queue on trunk and what required checks mean for the token in use, repository and Actions settings, workflow files, labels. ✓ / ! / ✗ / ?, exit 1 on any ✗. Also `ci doctor` and the dispatch command `doctor`. A setting the token cannot read is reported as ?, never as passing. |
+| `doctor` | `-C` | Read-only setup check: config, GitHub stacks available, merge queue on trunk and what required checks mean for the token in use, repository and Actions settings, workflow files, labels. ✓ / ! / ✗ / ?, exit 1 on any ✗. Also `ci doctor` and the dispatch command `doctor`. A setting the token cannot read is reported as ?, never as passing. |
 | `queue` | `--pr N` | Add any PR to the priority pool, then run a pass |
 | `status` | | Per branch: index, ✅/⬜, PR#, commits on its parent, "needs sync" if the parent tip is not an ancestor, "unpushed" if local differs from `PushedSHA`. |
 | `list` | | All stacks, with landed/total counts and the source. |
@@ -981,7 +998,7 @@ Exit codes: 0 for success, 1 for any error (message on stderr prefixed `stackq:`
 
 Precedence: flags, then config, then built-in defaults.
 
-`autoLand` (bool, default false): in atomic mode, land a stack by itself once every part is approved and green. `stackq ci tick` runs on each review, finished CI run and timer tick. It lands every open atomic stack that passes the same gates as `stackq land`, and leaves the others alone without a comment, a label or an error. Unlike `stackq land`, it also waits while a part has no checks reported at all (CI not started yet, or waiting for approval); without that, a stack could be queued before any CI ran on its parts. A repo whose parts never get checks should land by hand. A stack whose lander already targets trunk (or is in the queue) is skipped, so repeated events queue it once. If the enqueue itself failed after the retarget, run `stackq land` by hand. Pool PRs get their normal priority pass in the same tick.
+`autoLand` (bool, default false): in atomic mode, land a stack by itself once every part is approved and green. `stackq ci tick` runs on each review, finished CI run and timer tick. It lands every open atomic stack that passes the same gates as `stackq land`, and leaves the others alone without a comment, a label or an error. Unlike `stackq land`, it also waits while a part has no checks reported at all (CI not started yet, or waiting for approval); without that, a stack could be queued before any CI ran on its parts. A repo whose parts never get checks should land by hand. A stack stackq already asked GitHub to land (a pending or queued merge request, §14.4) is skipped, so repeated events land it once. Incremental stacks land part by part the same way. Pool PRs get their normal priority pass in the same tick.
 
 ---
 
@@ -1005,14 +1022,14 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Open_stacked: push (base = parent branch)
-  Open_stacked --> Open_on_trunk: parent merged → CI restack + retarget
-  Open_on_trunk --> Queued: land / CI enqueue / auto-merge when checks pass
+  [*] --> Stacked: push (base = parent branch, linked as a GitHub stack)
+  Stacked --> Requested: land (stackq asks GitHub to merge the top part or the next part)
+  Requested --> Queued: GitHub puts it (and the parts below) in the merge queue
+  Requested --> Paused: request failed (a rule, a conflict)
   Queued --> Merged: queue merges
-  Queued --> Blocked: dequeued (CI fail, conflict)
-  Open_on_trunk --> Conflict: restack conflicted
-  Blocked --> Queued: fix + stackq land
-  Conflict --> Open_on_trunk: manual rebase + push
+  Queued --> Paused: dequeued (CI fail, conflict)
+  Paused --> Requested: fix + stackq land
+  Stacked --> Stacked: a lower part merged → GitHub rebases + retargets it onto trunk
   Merged --> [*]
 ```
 
@@ -1030,16 +1047,16 @@ stateDiagram-v2
 | F6 | A branch changed locally and on the remote | Sync refuses | Reconcile by hand, then sync |
 | F7 | A push lease is rejected | Errors | `stackq sync`, then push |
 | F8 | A branch is checked out with dirty changes during sync | Errors | Commit or stash |
-| F9 | The CI restack conflicts | Comment + `stackq:conflict` label, no push, run fails | §5.4 |
-| F10 | Enqueue and the auto-merge fallback both fail | Comment + `stackq:blocked` label, run fails | Fix requirements; `stackq land --pr N` |
+| F9 | The stack is not linear (a lower branch changed, trunk moved) | The gate reports "not on top of part N"; GitHub shows **Rebase stack** | Use **Rebase stack**, or `stackq sync && stackq push`; then `stackq land` |
+| F10 | GitHub turns the merge request down (a rule, a conflict) | Comment with GitHub's message, `stackq:blocked`, status ⏸ | Fix it; `stackq land --pr N` |
 | F11 | The queue ejects a PR | Comment + `stackq:blocked` label | Fix; push; `stackq land --pr N` |
 | F12 | Event for a non-stack PR | No-op | n/a |
-| F13 | A CI push fails (not a lease issue: permissions, protection) | Run errors out; the PR is left on its old base | Check token permissions or branch protection |
+| F13 | Linking the GitHub stack fails (no stacks API, PRs in other stacks) | `push` fails after the PRs exist; `land` tries to link again and refuses if it can't | Unstack on GitHub, or fix the token; push again |
 | F14 | Two merges close together | The concurrency group serializes them; each sees the latest refs | n/a |
 | F15 | Local JSON lost | CI is unaffected. Locally there's no recovery command yet (§26). | Recreate by hand, or keep landing via CI |
 | F16 | Atomic land with an unapproved, change-requested or red part, or a broken chain | Lists every problem on the lander, adds `stackq:blocked`, queues nothing | Fix, then `stackq land` |
-| F17 | A part of an atomic stack merged on its own | Restacks every part above it, queues nothing, warns on the next part | `stackq land` lands the rest together |
-| F18 | Activation PR conflicts on restack | Comment + conflict label; the lander's branch is kept so the PR stays open | Resolve, push; merge when ready |
+| F17 | A part of an atomic stack merged by hand | GitHub merges the parts below it too and moves the rest onto trunk; stackq lands the rest together as usual | Nothing; `stackq land` lands the rest |
+| F18 | The activation PR conflicts after the rest landed | GitHub shows the conflict on it | Resolve on GitHub or locally; merge when ready |
 | F19 | Revert can't identify the landed commits, conflicts with later changes, or fails the file-set check | Refuses with an explanation; nothing is pushed | Revert by hand, or `--force` after checking |
 | F20 | Guard lint finds an entrypoint outside a flag check | Warns in `plan`/`split`; fails the split with `flags.enforce` | Wrap it in a flag check, or accept the warning |
 
@@ -1072,8 +1089,8 @@ stateDiagram-v2
 - **`allowUnreviewed`** makes stackq land a stack with no human approval. Use it only in a repository where nobody untrusted can push to `stack/**`, such as a sandbox.
 - **Supply chain.** `uses: OWNER/stackq@v0` and `version: latest` run whatever the newest release is, with the workflow's token. Anyone who can publish a release of stackq can run code in every repository that follows it. In a repository that matters, pin an exact version (`version: v0.1.7`, or the commit SHA in `uses:`) and review updates.
 - **Token choice.** The built-in `GITHUB_TOKEN` lives for one job. A PAT or App token (`STACKQ_TOKEN`) outlives it, so give it only the repositories and permissions stackq needs.
-- **Signed commits.** If the repo requires signed commits, CI rebases produce unsigned commits and pushes are rejected (F13). Support is a roadmap item (§26).
-- **Stale-review dismissal.** If "dismiss stale approvals on push" is on, every restack push dismisses approvals. Enqueue then fails, and auto-merge waits for re-approval. That is safe, but the stack won't flow unattended.
+- **Signed commits.** stackq's split creates unsigned commits. After that, rebases are GitHub's (**Rebase stack** and the restack after a merge produce signed commits).
+- **Stale-review dismissal.** If "dismiss stale approvals on push" is on, a push to a part (a local `stackq sync && stackq push`) dismisses its approvals; GitHub's **Rebase stack** keeps approvals when the diff did not change.
 
 ---
 
@@ -1114,17 +1131,24 @@ All tests use real git with temporary repositories. A bare repo plays the remote
 | stack | `TestPushLinksAndClosesOriginalPR` | Auto-detects the original PR; the bottom PR gets its description; upper PRs get only "Split from #N"; one link comment listing every slice; the original is closed; a second push duplicates nothing |
 | stack | `TestPushWithoutSourcePR` | `--no-source-pr` leaves the original PR untouched |
 | stack | `TestMarkerRoundTripKeepsAuthorText` | Body merging is idempotent and preserves author text |
-| land | `TestStackLandsOneByOneThroughQueue` | Landing an upper PR is refused; then 6 sequential simulated queue merges, each followed by AfterMerge in a fresh CI clone; every next PR is retargeted, queued, on top of main with exactly one commit, nav refreshed; final main tree equals the original branch; local sync marks everything landed |
-| land | `TestDevPicksUpCIRestackThenKeepsWorking` | Sync adopts CI's restack, and later local work pushes without lease errors |
-| land | `TestConflictPausesStack` | A trunk edit conflicting with slice 2 produces a comment naming the file and a conflict label, and nothing is pushed or queued |
-| land | `TestEnqueueFailureIsReported` | Blocked label added |
+| stack | `TestPushAddsNewPartsOnTopOfTheGitHubStack` | A part missing from the GitHub stack is added back on top by the next push |
+| stack | `TestPushLeavesTheBaseOfAStackedPRToGitHub` | Push never tries to retarget a stacked PR (GitHub would refuse) |
+| land | `TestPushLinksTheStackOnGitHub` | All four PRs, the activation PR on top, form one GitHub stack |
+| land | `TestAtomicStackLandsWithOneMergeRequestAndActivationWaits` | An unapproved part blocks landing; then one merge request for the lander queues the 3 parts bottom up, with no base edits; after the queue lands them, trunk equals the lander head with 3 commits and prod config untouched; the parts are merged, the lander says ✅ landed, the activation PR is on main, labeled, told and not merged; the original PR is told; a second finish changes nothing; revert restores the pre-stack tree |
+| land | `TestRevertAfterAStackLandsWithEachMergeMethod` | For rebase, merge-commit and squash, every part merged on its own; revert on top of a later unrelated change undoes the stack, keeps that change, and is merged with `--enqueue` |
+| land | `TestIncrementalStackLandsPartByPart` | One merge request per part; GitHub retargets the next part onto main; after the last, main equals the feature |
+| land | `TestATickLandsTheNextPartOfAnIncrementalStack` | With no "PR merged" run, the next tick lands part 2, once |
+| land | `TestLandingAHigherPartOfAnIncrementalStackTakesTheOnesBelow` | Landing part 3 makes one request that queues parts 1–3 |
+| land | `TestAutoLandWaitsQuietlyThenLandsOnce` | Pending checks: no request, no comment, the reason in the status; green: exactly one request over two ticks |
+| land | `TestAMergeRequestThatIsPendingThenFailsPausesTheStack` | A pending request is not repeated; a failed one pauses with GitHub's message; a paused stack is left alone; `land` asks again and clears the pause |
+| land | `TestAStackThatSilentlyLeftTheQueueIsPaused` | A queued stack that disappears from the queue is paused on the next tick |
 | land | `TestDequeuedPausesStack` | Comment and label; `land` retries and clears the label |
-| land | `TestOriginalPRHearsWhenStackLands` | The landed note is posted on the original PR only after the last merge |
+| land | `TestDevPicksUpGitHubsRestackThenKeepsWorking` | After GitHub rebases the next part server-side, sync adopts it and a follow-up push works |
+| land | `TestMergeErrorIsReported` | A failing merge call returns GitHub's error |
+| land | `TestAStackThatIsNotAGitHubStackIsLinkedWhenItLands` | Older stacks are linked first, then landed as one |
+| land | `TestTheActivationPRLandsOnlyWhenNamed` | Auto-land never merges it; `land --pr <activation>` does |
 | land | `TestIgnoresForeignPRs` | No marker means no-op |
-| land | `TestAtomicStackLandsAsOneEntryAndActivationWaits` | An unapproved part blocks landing (comment and label, nothing queued); the lander is then retargeted and queued alone; after the merge, trunk equals the lander head, the 3 parts arrive together, and prod config is untouched; lower parts are closed and their branches deleted; the activation PR is restacked onto main, labeled and not queued; the landing record has the revert command; revert restores the pre-stack trunk tree exactly |
-| land | `TestAtomicRevertMergeAndSquashMethods` | For the merge-commit and squash methods, revert on top of a later unrelated trunk change undoes the stack, keeps that change, and is queued with `--enqueue` |
-| land | `TestAtomicPartMergedAloneIsNotQueuedOn` | A stray merge of part 1 restacks the whole chain and warns, without queueing; `land` then lands the rest via the top PR |
-| land | `TestIncrementalStackLeavesActivationForHumans` | Incremental mode never queues the activation PR, and tells the original PR it is waiting |
+| land | `TestLandOnlyClaimsAMergeWhenThePoolAdmittedIt` | With a lagging pool search the log says it waits; the next pass makes the request and records it |
 | split | `TestPlanFlagsFirstActivationHeld` | Flags first and activation last even under a huge budget; only activation is held |
 | split | `TestGuardLint` | `if` and early-return guards pass; an unguarded `mux.HandleFunc` is reported, and `enforce` fails the plan |
 | stack | `TestFlagStackEveryPartBuildsAndActivationIsDraft` | Each part of the flag stack passes `go build`; the flag slice doesn't touch prod config; the activation PR is titled and marked as held |
@@ -1147,22 +1171,21 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
   - Validate `gh pr list --head` behavior.
   - Validate the `id` JSON field.
   - Validate GraphQL argument typing (`-f oid=` passed as a string for `GitObjectID`).
-  - Check whether `enqueuePullRequest` errors when checks are pending, and the exact error text.
-  - Check whether `enablePullRequestAutoMerge` with no `mergeMethod` is accepted on queue branches.
   - Confirm the `dequeued` event fires as expected.
 - **K1. (Wording fixed 2026-10-16.)** The conflict comment now says sync stops and prints the exact rebase command. Still worth adding: a `stackq sync --interactive` that leaves the rebase in progress in the user's worktree, plus `stackq continue`.
-- **K2. (Done 2026-10-26, §14.5.)** Enqueue errors are classified by GitHub's wording: closed, draft, moved head, missing PR and a token without permission are final and skip the auto-merge fallback, which also keeps a moved head from being queued unchecked. Other errors still fall back.
+- **K2. (Done 2026-10-26, §14.5.)** Refusals of the `enqueuePullRequest` mutation are classified by GitHub's wording. Since 2026-10-27 that mutation is used only to jump a PR outside a stack; merges go through the asynchronous merge API, whose answer carries GitHub's message.
+- **K14. GitHub stacks: merging not yet seen live (2026-10-27).** Creating stacks (also with the built-in token), the refused base change, force-pushes and drafts were checked live (§14.1). Still to see in the sandbox: a `merge-async` request for a stacked PR with the built-in token, its answers and timing, the queue entries it makes, the retarget of the activation PR, and `FinishLanded` after it. GitHub calls the API a preview that may change.
 - **K3. Merged-PR history is capped at the 200 most recent.** Older merged stack PRs lose their ✅ in the nav. This is cosmetic. Fix it by fetching specific PR numbers recorded in the markers, or with a search query.
 - **K4. (Done 2026-10-26.)** Config `cleanBetweenChecks` (default off) runs `git clean -fdx` in the slice worktree before each `--check`, so build output from one slice's check cannot make the next slice's check pass. The slice's own files are staged, so they stay. Off by default because a check that installs dependencies into the tree would reinstall them for every slice.
 - **K5. (Done 2026-10-26.)** In CI the marker's trunk must equal the repository's trunk: the config `trunk`, else the default branch from the event payload, else the resolved trunk. `markerOf` ignores any other marker and logs it once per PR. Local runs set no trunk and are unchanged. A repo that stacks onto a branch other than its default must set `trunk` in `.stackq.json`.
-- **K11. Atomic mode on live GitHub: verified end to end** (8-part stack: split, push, CI, retarget of the lander, one queue entry, 7 rebased per-part commits on trunk, parts closed, branches deleted, activation PR left as an unmerged draft). Still unverified because the sandbox used `allowUnreviewed`: whether retargeting keeps existing approvals, and how CODEOWNERS review applies to the lander's full diff (§28.6).
+- **K11. (Superseded 2026-10-27.)** Atomic mode was verified end to end on live GitHub with stackq's own retarget-and-queue landing (8-part stack, one queue entry, parts closed, activation left as a draft). That landing was replaced by GitHub stacks (§14), where every PR keeps its own review and trunk's rules apply to each, so the open questions about approvals and CODEOWNERS on a retargeted lander no longer arise. The new landing is K14.
 - **K13. Priority on live GitHub: the `mergeQueue` GraphQL shape and the pool pass are verified** (2026-10-25). Still unverified: `jump` permissions, and whether a pass triggered by Dependabot can read secrets (§31.7).
 - **K12. Revert relies on `refs/pull/N/head`** to find a PR's commits after its branch is deleted. GitHub keeps these refs, but forks and some mirrors don't.
 - **K6. `--force` deletion of prefix branches** fails if any of them is checked out; the error is the raw git error.
 - **K7. Concurrency groups drop pending runs (seen live, 2026-10-25).** GitHub keeps one running and **one pending** run per group; a newer pending run cancels the older one, even if the newer run's job is skipped by its `if`. With one shared group `stackq`, a label added while a stackq run was busy lost its split: the same label event also starts `stackq.yml`, whose no-op run took the pending slot and cancelled the split (which never ran, and left the `stackq:split` label on). Fixed in the examples: `stackq-split.yml` has its own group per source PR or branch (and a separate one for `stackq:plan` previews; runs for any other label get a group of their own), and `stackq.yml` gives runs that would do nothing a group of their own (`stackq-skipped-<run id>`). Real stackq runs still share `stackq`; a real run replaced by a newer real run is harmless because every run looks at all stacks, and a lost `dequeued` event is caught by the next tick (§28.4). Landing also refuses a stack that has fewer PRs than its marker's `total` (§28.2), so a split that is still opening its PRs is never landed half-way.
 - **K8. Commit hooks are skipped** at creation (`--no-verify`). This is intended, but document it.
 - **K9. `FullyApplied` treats a branch with zero unique commits as landed.** An intentionally empty slice would be marked landed. That's rare, since `--allow-empty` commits only happen if a slice has no file changes, which can't occur.
-- **K10. No support for multiple children** beyond what the marker allows. The code handles a list of children, but `split` only ever creates linear stacks.
+- **K10. Linear stacks only.** `split` creates linear stacks, and GitHub stacks are linear too.
 - **G1. (Done 2026-10-26.)** `sync` uses the forge when `gh` is available (`SyncOptions.Forge`). A part counts as landed if its PR is merged and the PR's head is the branch's tip or its last pushed commit; in an atomic stack the parts below a merged part land with it. A merged PR whose branch has later commits is reported and kept. Forge errors are noted and sync continues on git alone. (A squash of a one-commit part is already recognised by `git cherry`, since the patch is the same; parts with extra commits, such as review fix-ups, are not.)
 - **G2. Hunk-level splitting.** Not supported. The design is in §27.4.
 - **G3. TS path aliases and monorepo package imports.** Read `tsconfig.json` `compilerOptions.paths` and workspace `package.json` names.
@@ -1181,9 +1204,10 @@ Issues (K) are bugs or rough edges; gaps (G) are missing features.
 | D2 | Shell out to `git` | go-git | Exact git semantics (rebase, cherry, worktrees, rename detection) that go-git doesn't fully implement |
 | D3 | Shell out to `gh` | REST/GraphQL via net/http | Auth handled (`GH_TOKEN`, `gh auth`), preinstalled on runners, less code. The cost is a runtime dependency and coarse error handling. |
 | D4 | PR-body marker as CI source of truth | A state file committed to the repo; a GitHub App with a DB; branch naming conventions | Stateless CI, survives lost local state, visible to humans, no extra infrastructure |
-| D5 | Match children by `marker.parent == merged.headRef` | Match by `baseRef` | GitHub may already have retargeted the child on branch auto-delete |
-| D6 | Cut at the merged PR's `headRefOid` | Merge-base heuristics; plain rebase | Exact, and works for every merge method |
-| D7 | Atomic landing by default; incremental as an option (revised 2026-10-16) | Sequential only; enqueue every PR separately | One queue entry gives all-or-nothing landing and a single revert (§28); separately queued PRs have the problems in §14.4 |
+| D5 | Match stack PRs by marker | Match by `baseRef` | GitHub retargets stacked PRs itself, so bases change under stackq |
+| D6 | Revert cuts each part at the head of the part below | Merge-base heuristics | In a GitHub stack each part merges on its own and its branch also holds the parts below; this finds exactly its own commits for every merge method |
+| D7 | Atomic landing by default; incremental as an option (revised 2026-10-16) | Sequential only; enqueue every PR separately | All-or-nothing landing and a single revert (§28) |
+| D14 | Land with GitHub stacks (2026-10-27) | Keep stackq's retarget-and-restack landing | GitHub merges a stack as one request through the queue, enforces trunk's rules and CI on every PR, and restacks server-side; stackq's way needed a retarget GitHub now refuses for stacked PRs, a cascade of force-pushes, closed instead of merged parts, and an auto-merge fallback. Dropped with it: auto-merge fallback, jump for stacks, review requests on the lander, conflict comments on restack (GitHub shows **Rebase stack**). Cost: github.com only, on a preview API. |
 | D7a | Flags first, activation held (2026-10-16) | Trust authors to order flags by hand | Partial stacks on trunk, or a stack landing before the flag exists, must never expose unfinished code (§29) |
 | D8 | One commit per slice | Preserve the original commit history | Original commits rarely align with slice boundaries; one commit keeps restacks trivial |
 | D9 | Temporary worktrees for all mutations | Operate in the user's checkout | Never disturb the user's state (G3); works while they have uncommitted changes |
@@ -1203,7 +1227,7 @@ Ordered by value to you.
 1. **Live validation (K0).**
    - Create a sandbox repo with the merge queue on (rebase method), an App token, and a trivial CI with `merge_group`.
    - Run the full flow with a 3-slice stack.
-   - Capture the actual error strings from `enqueuePullRequest`.
+   - Capture the actual answers of `merge-async` for a GitHub stack (K14).
    - Fix anything that breaks.
    - Add a `STACKQ_E2E_REPO` env-gated integration test that runs against the sandbox.
 2. **Fix K1:** make the conflict comment and the sync behavior agree. Add `stackq sync --stop` and `stackq continue`.
@@ -1242,7 +1266,7 @@ Also in P1, unnumbered:
 
 ### P3: throughput and ecosystem
 
-17. **Batch queue experiment (§14.4).** Measure what GitHub's queue does when stacked PRs are all retargeted and enqueued, with the rebase method. If it's clean, offer `land --all` behind a flag.
+17. **(Obsolete since 2026-10-27.)** GitHub stacks put a stack's PRs in the queue together (§14.1).
 18. Forge adapters: Mergify (native stacks), GitLab merge trains.
 19. **Morph integration.** Morph's mass repository migrations produce exactly the large branches this tool is for. Expose `split.Make` and `stack.Create` as a library. Morph can then emit a reviewable stack per target repo, run `--check` with the repo's own build, and hand landing to the Action. That turns an N-repo migration into N small, auto-landing stacks. Two things to design:
     - a "plan file" format agents can write, which would also serve 14,
@@ -1420,7 +1444,7 @@ This handles one file that mixes concerns, such as a 3,000-line `client.go` with
 **Modes** (`ai.resolve.mode`):
 - **`off`** (default for v1): today's behavior, a comment plus the `stackq:conflict` label.
 - **`suggest`**: CI pushes the guarded resolution to a side branch `stackq/resolve/<branch>/<short-sha>` and comments with the diff of the resolution only, the explanation, the guard results and one-line actions:
-  - `/stackq apply-resolution`: comment-triggered via an `issue_comment` workflow. Only users with write access are honored, and the side branch must be unchanged since the comment (a SHA check). The resolved commit is then pushed to the stack branch with a lease, the PR is retargeted and queued.
+  - `/stackq apply-resolution`: comment-triggered via an `issue_comment` workflow. Only users with write access are honored, and the side branch must be unchanged since the comment (a SHA check). The resolved commit is then pushed to the stack branch with a lease, and the stack is landed again.
   - `/stackq reject-resolution`: delete the side branch and keep the conflict label.
   
   Locally, `stackq resolve` runs the same flow and shows the diff for a y/n answer.
@@ -1601,7 +1625,7 @@ Phases A and B are pure engineering and strengthen v0 on their own. They should 
 
 ## 28. Atomic landing and rollback
 
-Status: **implemented** (2026-10-16), and the default for new stacks. Tested against the fake GitHub and, since 2026-10-25, end to end on live GitHub; approvals and CODEOWNERS on the lander are still unverified (K11).
+Status: **implemented** (2026-10-16), and the default for new stacks. Since 2026-10-27 it lands through GitHub stacks (§14): tested against a fake GitHub that mirrors them; the merge itself is not yet seen live (K14).
 
 ### 28.1 Why
 
@@ -1609,28 +1633,32 @@ A stack that came from one PR is one change. With incremental landing, trunk hol
 
 Atomic landing keeps review granular but makes the merge all-or-nothing:
 - **Review** stays per part. Each part has its own PR, diff, approvals and checks.
-- **Merge** is one merge-queue entry that contains every part. The queue tests the whole stack against the latest trunk and merges all of it, or ejects all of it.
+- **Merge** is one request: GitHub merges every part, bottom up, through the merge queue (one merge group), or none of them. Each part becomes a merged PR with its own commits on trunk.
 - **Rollback** is one revert PR (§28.5).
 
-### 28.2 `stackq land` in atomic mode (`landAtomic`)
+### 28.2 `stackq land` (`attempt`)
 
 Given any PR of the stack (locally, the bottom PR is picked for you):
 
-1. **Collect the parts.** These are the open stack PRs that are not held (§29). A part closed without merging stops the landing. A part that already merged on its own is skipped; the rest still land together.
-2. **Fetch** trunk and every part's head.
-3. **Gate each part.** All problems are collected and reported together:
+1. **Pick the target.** Atomic: the top part (the highest open part that is not held, §29); merging it merges everything below. Incremental: the lowest open part, or with `--pr N` part N. The activation PR is the target only when it is named.
+2. **Already landing?** `landingState` (§14.4): waiting in the pool, queued or pending leaves it alone; a request GitHub failed pauses it (automatic runs); gone from the queue pauses it.
+3. **Make sure it is a GitHub stack** (`ensureGitHubStack`): stacks pushed before GitHub stacks, or unstacked on GitHub since, are linked first.
+4. **Fetch** trunk and the head of every part that will merge (the target and every open part below it).
+5. **Gate each of those parts.** All problems are collected and reported together:
+   - **Not a draft** (the activation PR aside).
    - **No requested changes** in anyone's latest review.
    - **Approvals:** at least `minApprovals` (default 1) authors whose latest review approves. `--allow-unreviewed` skips this check.
-   - **Checks** are not `failure` or `pending`. `none` is allowed, because many repos don't run CI on PRs that target non-trunk branches. See §28.6 for how to turn it on.
-   - **Chain:** each part's head contains the part below it. If not, run `stackq sync && stackq push`.
-4. **If anything fails,** stackq comments the list on the lander, adds `stackq:blocked`, exits non-zero, and queues nothing.
-5. **Otherwise:**
-   1. Retarget the **lander**, the topmost non-held part, to trunk. Its diff against trunk is now the whole stack.
-   2. Comment a landing table on the lander: part, PR, approvers and checks.
-   3. Label every part `stackq:landing`.
-   4. Enqueue the lander, with `expectedHeadOid` set to the fetched head.
+   - **Checks** are not `failure` or `pending`. `none` is allowed when landing by hand; automatic landing waits for checks.
+   - **Chain:** each part's head contains the part below it. If not: **Rebase stack** on GitHub, or `stackq sync && stackq push`.
 
-Reviews and checks come from `Forge.Details`: `gh pr view --json latestReviews,statusCheckRollup,mergeCommit,commits`. Checks roll up as follows (`RollupChecks`):
+   GitHub enforces trunk's rules on every PR of the stack as well; stackq's gate decides *when* to ask, and keeps quiet until then.
+6. **If anything fails,** automatic runs write it to the target's status section (§28.3a) and do nothing else; `stackq land` comments the list on the target, adds `stackq:blocked` and exits non-zero.
+7. **Otherwise:**
+   1. Comment a landing table on the target: part, PR, approvers and checks.
+   2. Label every part that will merge `stackq:landing`.
+   3. Ask GitHub to merge the target (`Merge`, with the fetched head as the expected `sha`), or put it in the priority pool (§31). The request is recorded in the target's status section (§14.4).
+
+Reviews and checks come from `Forge.Details`: `gh pr view --json latestReviews,statusCheckRollup,mergeCommit,commits,headRefOid` plus the head commit's check runs. Checks roll up as follows (`RollupChecks`):
 - `failure` if any check is FAILURE, ERROR, CANCELLED, TIMED_OUT, ACTION_REQUIRED or STALE,
 - else `pending` if any is still running,
 - else `success`,
@@ -1638,14 +1666,9 @@ Reviews and checks come from `Forge.Details`: `gh pr view --json latestReviews,s
 
 **Incomplete stacks.** A split opens its PRs one after the other. Before landing, every stack must have as many PRs as `total` in its marker (merged ones count). Otherwise the highest PR that exists would be taken for the top, and, with a token that starts `pull_request` CI, the first parts can be green before the last one exists. Automatic landing waits quietly; `stackq land` says "stack X has N of M PRs so far".
 
-### 28.3 After the queue merges the lander (`AfterMerge` → `finishAtomic`)
+### 28.3 After GitHub merges the stack
 
-1. **Restack held children.** Children of the lander are the held activation PR(s). They are rebased onto trunk with `--onto trunk <lander pre-merge head>`, pushed with a lease, retargeted to trunk, labeled `stackq:activation`, and given a comment saying they are ready but will not be queued.
-2. **Close every other part.** Each gets the comment "Landed on `main` as part of stack X, inside #L", and the `stackq:landing` label is removed.
-3. **Delete the parts' branches** with a lease, unless `keepBranches` is set. The lander's own branch is kept if restacking a held child failed, because deleting a PR's base branch closes the PR.
-4. **Record the landing on the lander:** the trunk commit and the rollback instructions.
-5. **Note it on the original PR** (§12.1): "landed atomically via #L", plus any waiting activation PR.
-6. **Refresh the nav** on every open PR. Closed-as-landed parts show ✅.
+See §14.3: the parts are merged PRs, GitHub has moved the activation PR onto trunk, and stackq clears labels and status, marks the target ✅ *Landed* with the trunk commit and the rollback command, refreshes the nav, labels and announces the activation PR, and tells the original PR.
 
 ### 28.3a Landing status on the lander
 
@@ -1655,18 +1678,19 @@ Automatic landing is quiet by design: a stack that is not ready gets no comment 
 |---|---|
 | Not ready | ⏳ the gate's problems, one line per part (`part 2 #42: checks are still running`) |
 | In the priority pool | ⧗ waiting for a merge-queue slot |
-| Queued, or auto-merge pending | 🚀 landing as one entry |
-| Left the queue | ⏸ paused, with what to do |
-| Landed | removed (the landing comment is the record) |
+| Merge requested (pending or queued) | 🚀 landing: GitHub is merging N PRs as one request (and the hidden request tag, §14.4) |
+| Request failed, or left the queue | ⏸ paused, with GitHub's reason and what to do |
+| Landed | ✅ landed, with the trunk commit and the rollback command |
 
 It is written only when its text changes, so a tick that finds nothing new makes no API call for it.
 
-### 28.4 Safety nets in atomic mode
+### 28.4 Safety nets
 
-- **A part merged on its own** by mistake: CI rebases the next part onto trunk *and cascades*, rebasing every part above it so the chain stays intact. It queues nothing, and comments a warning. `stackq land` then lands the remainder together.
-- **A dequeued lander:** the comment says nothing from the stack reached trunk, and the lander gets `stackq:blocked`. Fix the problem, then run `stackq land` again.
-- **A dequeue nobody handled.** The workflows share one concurrency group, and GitHub keeps only one pending run per group: a newer run replaces an older pending one, so the `dequeued` run can be lost. Every `tick` therefore checks each landing lander: if it is not in the merge queue, not waiting in the priority pool, has no auto-merge pending and has not merged, it is paused exactly as the `dequeued` handler would pause it. Anything uncertain (the queue cannot be read, a lookup fails) counts as still landing. A pause found to be wrong is cleared when the stack lands.
-- **Planned (§30.6): a required status check `stackq/atomic`** that fails on every part except the lander, so a part can't be merged on its own at all.
+- **A part merged by hand:** GitHub merges the parts below it with it and moves the rest onto trunk; nothing reaches trunk out of order. `stackq land` lands the rest together.
+- **A refused merge request** (a rule a PR does not meet, a conflict): paused with GitHub's message (§14.4).
+- **A dequeued stack:** the `dequeued` event pauses it; GitHub also takes the PRs above an ejected PR out of the queue.
+- **A dequeue nobody handled.** The workflows share one concurrency group, and GitHub keeps only one pending run per group, so the `dequeued` run can be lost. Every `tick` therefore checks each stack it asked to land: if the target is not in the merge queue, not in the priority pool, has no pending request and has not merged, it is paused exactly as the `dequeued` handler would pause it. Anything uncertain counts as still landing.
+- **An incomplete stack** is never landed (§28.2).
 
 ### 28.5 Rollback (`stackq revert`)
 
@@ -1678,12 +1702,11 @@ Rollback has three tiers, fastest first:
 What `Revert` does (`internal/land/revert.go`):
 
 1. **Targets.**
-   - Atomic: the lander. Its single merge-queue entry carries everything.
-   - Incremental: every merged PR of the stack, newest first.
+   - Every merged PR of the stack, newest first. With GitHub stacks each part merges as its own PR, also in atomic mode. (Stacks landed with stackq's earlier atomic landing have one merged lander and closed parts; the lander is then the only target.)
    - `--only` reverts just the given PR.
    - The activation PR is included if it has merged.
 2. **Fetch** trunk and `refs/pull/N/head` for each target, which GitHub keeps after branches are deleted.
-3. **Identify what each PR put on trunk** (`identify`). The starting point is the PR's recorded merge commit X (`mergeCommit.oid`). Then:
+3. **Identify what each PR put on trunk** (`identify`). The starting point is the PR's recorded merge commit X (`mergeCommit.oid`). A part's own commits are those after the head of the merged part below it (when that head is an ancestor of its own), since in a GitHub stack a part's branch also holds the parts below; otherwise those after its merge base with trunk. Then:
    - **Merge method:** X has two parents, so revert X with `-m 1`.
    - **Rebase method:** walk back from X. The last *k* trunk commits must match the PR's own *k* commits, either by `git patch-id --stable` or by subject plus file list (used when trunk changes nearby altered the diff context). Revert those, newest first.
    - **Squash method:** X has one parent, and its file set equals the PR's file set, so revert X.
@@ -1700,19 +1723,14 @@ In CI this is available as `stackq ci revert --pr N` and as the workflow_dispatc
 
 **Re-landing after a revert** is not automated yet (§30.12). For now, revert the revert PR.
 
-### 28.6 Caveats (K11; checks on stacked PRs verified live, the rest still to verify)
+### 28.6 Caveats
 
-- **CODEOWNERS on the lander.** Once retargeted, the lander's diff covers every file in the stack, and required code-owner reviews are evaluated on that diff. Owners who approved a lower part may need to approve the lander too. Options:
-  1. request their review at land time. **Done in part (2026-10-26):** when GitHub would not queue the lander (auto-merge is waiting for the PR's requirements, so `landingState` is `auto-merge`), stackq asks the users who approved the lower parts, and have not approved the lander, to review it (`RequestReviews`), and says so in the status section. This asks people, not CODEOWNERS entries: stackq does not parse the CODEOWNERS file, so an owner who never reviewed a part is not asked here (GitHub's own owner request on the PR still applies). It changes no gate and does nothing under `allowUnreviewed`. **Not tested on GitHub:** the sandbox has one user, so a real run needs a repo with a second reviewer and a code-owner rule,
-  2. align parts with owners (§30.5), so each owner approves one part and then the lander,
-  3. give the stackq App a ruleset bypass. Discouraged.
-- **Approval retention.** Retargeting is not a push, so "dismiss stale approvals on push" should not fire. Confirm this. Restacks *are* pushes and can dismiss approvals.
-- **Checks on stacked PRs.** If CI uses `on: pull_request: branches: [main]`, parts that target other branches get no checks, and the gate sees `none`. Use `branches: [main, 'stack/**']`, or drop the filter.
-- **Queue limits.** One entry carries the whole stack. Very large stacks can hit queue timeouts; keep stacks to a size your CI can test in one run.
-- **Bisectability.** Rebase and merge methods keep one commit per part on trunk, so `git bisect` works per part. Squash collapses the stack into one commit.
-
----
-
+- **Reviews and CODEOWNERS** are GitHub's: trunk's rules apply to every PR in a GitHub stack, so each part needs what a PR to trunk needs. stackq's `minApprovals` gate only decides when to ask GitHub; it cannot make GitHub accept less. (The earlier lander-review request, added 2026-10-26, was removed with the retarget it worked around.)
+- **Approval retention.** A force-push to a part (a restack) can dismiss approvals under "dismiss stale approvals". GitHub's **Rebase stack** keeps approvals when a diff did not change.
+- **Checks on stacked PRs.** `pull_request` workflows for trunk run for every PR in a GitHub stack. With the built-in token, stackq's split still starts CI with `workflow_dispatch` (§15.3).
+- **Queue limits.** The merge queue keeps a stack in one merge group, up to 50 % over its size limit; a bigger stack goes into the next group as one unit.
+- **Bisectability.** Every part merges as its own PR, so trunk has each part's commits in order with every merge method (squash gives one commit per part).
+- **No jump.** A stack cannot jump the queue (§14.5).
 
 ### 28.7 Reminders for waiting activation PRs
 
@@ -1757,7 +1775,7 @@ Planning (§9.2 step 3.0):
 What `Hold` means:
 - The PR is opened as a **draft**, titled `[<stack> activation] …`, with `"hold":true` in its marker and a 🔒 notice in the body.
 - It is **never queued automatically**, in either landing mode.
-- Once everything else is on trunk, CI rebases it onto trunk, retargets it, labels it `stackq:activation`, and comments that it is ready. A human merges it, or runs `stackq land --pr N`, when it's time to turn the feature on. If it waits longer than `activationReminderDays` (default 7), stackq comments again (§28.7).
+- It sits on top of the GitHub stack. Once everything else is on trunk, GitHub rebases and retargets it onto trunk, and stackq labels it `stackq:activation` and comments that it is ready. A human merges it, or runs `stackq land --pr N`, when it's time to turn the feature on. If it waits longer than `activationReminderDays` (default 7), stackq comments again (§28.7).
 - The atomic lander is the topmost part that isn't held, so the activation never rides along.
 
 The top-of-stack invariant (G2) still holds: the top branch, including activation, equals the source branch. Landing everything except activation leaves trunk equal to the lander's head (tested).
@@ -1815,7 +1833,7 @@ An atomic merge is not an atomic deploy. The new code and the old code run side 
 
 ### 30.3 Reviews and approvals
 
-- **CODEOWNERS on the lander** (§28.6).
+- **CODEOWNERS:** with GitHub stacks, trunk's rules (CODEOWNERS included) apply to every PR in the stack (§28.6).
 - **Ownership-aware splitting** (§30.5).
 - **Re-review automation:** after a restack dismisses approvals, re-request reviews from the same people, with a note explaining that only the base changed. Include `git range-diff` output to prove it.
 
@@ -1833,10 +1851,7 @@ Use CODEOWNERS as a grouping hint, so each part has a single owning team: fewer 
 
 ### 30.6 Guard rails against wrong merges
 
-- **Required check `stackq/atomic`:**
-  - Every part of an atomic stack except the lander gets a failing status: "lands via #L, don't merge on its own".
-  - The lander gets a passing status at land time.
-  - The workflow also reports success on `merge_group` events, so the queue doesn't stall.
+- **(Mostly moot with GitHub stacks.)** A part merged by hand now takes the parts below it with it, so nothing reaches trunk out of order; it can still land a stack half-way. A required check that fails on every part but the lander would stop that, but it needs an App token (§15.3a).
 - **Protect `stack/**` branches with a ruleset,** so only the author and the stackq App can push.
 - **Lock the original PR** after `--close-source`, to prevent accidental reopen-and-merge.
 
@@ -1931,14 +1946,14 @@ With these weights and 30-minute aging, a normal PR overtakes a fresh small PR a
 
 A pool PR is skipped (it stays in the pool, with the reason in the report) when:
 - it doesn't target the queue branch, or it's a draft;
-- it's a non-lander part of an atomic stack (it lands inside the lander);
+- it's a non-lander part of an atomic stack (it lands with the lander);
 - someone's latest review requests changes;
 - checks are failing or still running;
 - it has no approval, when `requireApproval` is on (the default).
 
 A PR already in GitHub's queue, for example one queued by hand, has its pool label removed.
 
-If `enqueuePullRequest` fails, the PR leaves the pool, gets `stackq:blocked`, and receives a single comment with the error. Re-adding the label retries it. No comment spam.
+Admitting a PR makes a merge request (§14.4), or a jump for a PR outside a stack. If that fails, the PR leaves the pool, gets `stackq:blocked`, and receives a single comment with the error. Re-adding the label retries it. No comment spam.
 
 ### 31.5 When a pass runs (`Schedule`)
 
@@ -1962,15 +1977,15 @@ Commands:
 
 ### 31.6 Interplay with stacks
 
-- **Atomic stacks:** `stackq land` checks the parts as before, then puts the lander in the pool. Its size is the whole stack, so it is usually `normal` and relies on aging. Label it `hotfix` (or similar) to promote it.
-- **Incremental stacks:** each restacked next part enters the pool.
+- **Atomic stacks:** `stackq land` checks the parts as before, then puts the top part in the pool; admitting it asks GitHub to merge the whole stack. Its size is the whole stack, so it is usually `normal` and relies on aging. Label it `hotfix` (or similar) to promote it. A stack cannot jump, so an urgent stack is admitted first but joins the back of the queue.
+- **Incremental stacks:** each next part enters the pool; a part's base is the part below it, so eligibility checks the stack's trunk instead.
 - **The activation PR** never enters the pool automatically. `stackq queue --pr N` sends it.
 
 ### 31.7 Limits and caveats
 
 - **PRs queued outside stackq** ("Merge when ready", GitHub auto-merge) enter GitHub's queue directly, in FIFO order. stackq counts them as in-flight but can't reorder them. For full effect, route merges through the label. Teams can enforce that with a ruleset that restricts who can merge, letting only the stackq App enqueue.
 - **Dependabot-triggered workflows** get read-only tokens and no Actions secrets, so the App token step fails on Dependabot's own `labeled` and `pull_request_review` events. Either add the App id and key as Dependabot secrets too, or rely on the cron and `workflow_run` passes, which run in the default branch's context. Use `labels: ["stackq:queue", "dependencies"]` in `dependabot.yml` so bumps join the pool automatically.
-- **Jump permissions** aren't documented; an admin- or bypass-level App may be required. The fallback is a normal enqueue.
+- **Jump permissions** aren't documented; an admin- or bypass-level App may be required. The fallback is a normal merge request. Only PRs outside a GitHub stack can jump.
 - **A small `maxInFlight` limits batching.** If CI is fast and the queue groups many PRs, raise it. Priority then matters less, because fewer PRs wait.
 - **No preemption.** stackq never dequeues a lower-priority entry to make room, because that would throw away its CI progress. A future `preempt` option could dequeue entries still in `QUEUED` state (not yet building).
 
@@ -1985,7 +2000,7 @@ Commands:
 | `land.TestSchedulerPutsVulnAndSmallFirst` | With a PR already queued by hand, the CVE fix jumps in front of it and the Dependabot bump takes the last slot. Drafts, pending checks and other-branch PRs are skipped with reasons. After two merges, the small PRs go before the big one, oldest first |
 | `land.TestSchedulerAgingLetsBigPRThrough` | A 12-hour-old big PR wins the only slot over a fresh small one |
 | `land.TestSchedulerDryRunChangesNothing` | `--dry-run` decides but doesn't enqueue |
-| `land.TestAtomicLandAndRevertGoThroughPriority` | Only the lander of an atomic stack is queued, never a part labelled by mistake; the stack's revert jumps ahead of an already-queued big PR |
+| `land.TestAtomicLandAndRevertGoThroughPriority` | Only the lander of an atomic stack gets a merge request (GitHub queues the parts with it), never a part labelled by mistake; the stack's revert (a PR outside the stack) jumps ahead of an already-queued big PR |
 
 ---
 
@@ -2029,7 +2044,7 @@ Then in consuming repos, use `uses: <you>/stackq@v0.1.0` (or a `v0` moving tag).
 
 1. Create a sandbox repo. Add a tiny Go module and a CI workflow with `pull_request` and `merge_group`.
 2. Branch protection on `main`: require a status check, and require the merge queue (rebase method).
-3. Settings → General → turn on "Allow auto-merge".
+3. GitHub stacks need no setting; `stackq doctor` checks they are available.
 4. Create a GitHub App with Contents and Pull requests set to Read & write. Install it on the sandbox. Set `STACKQ_APP_ID` (variable) and `STACKQ_APP_KEY` (secret).
 5. Copy `examples/stackq.yml` and point `uses:` at your stackq repo.
 6. Locally, make a feature branch touching 3+ packages, then run `stackq plan`, `stackq split --check "go build ./..."`, `stackq push`, `stackq land`.
@@ -2098,10 +2113,10 @@ stack/feature/05-internal-old
 stack/feature/06-docs
 ```
 
-**Landing:**
-1. `land` queues #1.
-2. The queue merges #1.
-3. The Action rebases `02` with `--onto main <#1 head>`, pushes it, retargets #2 to `main`, and queues #2.
-4. This repeats through #6.
+**Landing (incremental):**
+1. `push` links #1–#6 as one GitHub stack.
+2. `land` asks GitHub to merge #1; the queue merges it.
+3. GitHub rebases and retargets #2 onto `main`; the next tick asks GitHub to merge #2.
+4. This repeats through #6. (Atomic: one request for #6 merges all six.)
 
 After the last merge, `main`'s tree equals the original `feature` tree. The land test asserts exactly that.

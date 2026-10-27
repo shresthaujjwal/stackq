@@ -52,7 +52,7 @@ type NavEntry struct {
 	Branch string
 	Merged bool
 	Hold   bool
-	Closed bool // closed after landing as part of an atomic stack
+	Closed bool // closed after landing (stacks landed before GitHub stacks)
 }
 
 // Lander is the PR that carries an atomic stack into the queue: the
@@ -78,18 +78,18 @@ func RenderBlock(m Marker, nav []NavEntry) string {
 	lander := Lander(nav)
 	switch {
 	case m.Hold:
-		fmt.Fprintf(&b, "🔒 **Activation PR.** It holds the changes that switch the feature on, so it is never queued "+
-			"automatically. Once the rest of the stack is on `%s`, it is rebased there; merge it when you are ready to enable.", m.Trunk)
+		fmt.Fprintf(&b, "🔒 **Activation PR.** It holds the changes that switch the feature on, so stackq never merges it. "+
+			"It sits on top of the GitHub stack; once the rest is on `%s`, GitHub moves it there. Merge it when you are ready to enable.", m.Trunk)
 	case m.Atomic():
 		ref := "the top PR"
 		if lander.PR > 0 {
 			ref = fmt.Sprintf("#%d", lander.PR)
 		}
-		fmt.Fprintf(&b, "**Lands atomically:** review and approve each part, then `stackq land` sends the whole stack "+
-			"to the merge queue as one entry through %s. Don't merge parts on their own.", ref)
+		fmt.Fprintf(&b, "**Lands atomically:** review and approve each part, then `stackq land` asks GitHub to merge %s, "+
+			"which merges the whole stack into `%s` bottom up as one request. Merging a part yourself also merges the parts below it.", ref, m.Trunk)
 	default:
-		fmt.Fprintf(&b, "Lands bottom-up through the merge queue; "+
-			"after each merge the next PR is rebased onto `%s` and queued automatically.", m.Trunk)
+		fmt.Fprintf(&b, "Lands part by part, bottom up: each part is merged once it is ready, "+
+			"and GitHub moves the next one onto `%s`.", m.Trunk)
 	}
 	if m.Source > 0 {
 		fmt.Fprintf(&b, " Split from #%d.", m.Source)

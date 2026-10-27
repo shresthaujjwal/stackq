@@ -20,21 +20,32 @@ type Fake struct {
 	next     int
 	Comments map[int][]string
 	Labels   map[int]map[string]bool
+	// Enqueued is every PR a Merge or Jump put in the queue, in order.
 	Enqueued []int
+	// Merges is the PR each Merge call was made for, in order.
+	Merges []int
 	// MQ is the simulated merge queue, front first.
 	MQ []QueueEntry
-	// Jumped records PRs enqueued with Jump.
+	// Jumped records PRs queued with Jump.
 	Jumped []int
-	// ReviewRequests is who RequestReviews was asked to ask, per PR.
-	ReviewRequests map[int][]string
+	// Stacks are the GitHub stacks, bottom first, by stack number; Base is
+	// each stack's trunk.
+	Stacks    map[int][]int
+	StackBase map[int]string
+	// MergePending leaves merge requests pending instead of enqueued, as
+	// GitHub does for the first moments.
+	MergePending bool
+	// Requests are the merge requests by uuid; tests may change their status.
+	Requests map[string]*MergeRequest
 	// Ready overrides ReadyAt per PR; default is the PR's CreatedAt.
 	Ready map[int]time.Time
 	// ReadyFor overrides ReadyAt for one PR and label.
 	ReadyFor map[ReadyKey]time.Time
 	// PRDetails overrides Details per PR; the default is one approval and
 	// passing checks.
-	PRDetails  map[int]Details
-	EnqueueErr error
+	PRDetails map[int]Details
+	// MergeErr makes Merge and Jump fail.
+	MergeErr error
 	// QueueErr makes Queue fail, as when the branch has no merge queue.
 	QueueErr error
 	// PoolLag makes ListPool return nothing, as when the label search has not
@@ -46,7 +57,8 @@ type Fake struct {
 
 func NewFake() *Fake {
 	return &Fake{PRs: map[int]*PR{}, next: 1, Comments: map[int][]string{}, Labels: map[int]map[string]bool{},
-		PRDetails: map[int]Details{}, Ready: map[int]time.Time{}}
+		PRDetails: map[int]Details{}, Ready: map[int]time.Time{}, Stacks: map[int][]int{}, StackBase: map[int]string{},
+		Requests: map[string]*MergeRequest{}}
 }
 
 func (f *Fake) refresh(p *PR) {
@@ -123,7 +135,7 @@ func (f *Fake) CreatePR(head, base, title, body string, draft bool) (PR, error) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := &PR{Number: f.next, NodeID: fmt.Sprintf("PR_%d", f.next), Title: title, Body: body,
-		HeadRef: head, BaseRef: base, State: "OPEN"}
+		HeadRef: head, BaseRef: base, State: "OPEN", Draft: draft}
 	f.next++
 	f.refresh(p)
 	f.PRs[p.Number] = p
@@ -137,7 +149,10 @@ func (f *Fake) EditPR(n int, base, body *string) error {
 	if !ok {
 		return fmt.Errorf("no PR #%d", n)
 	}
-	if base != nil {
+	if base != nil && *base != p.BaseRef {
+		if f.stackOf(n) != 0 {
+			return fmt.Errorf("Validation Failed: Cannot change the base branch because the pull request is part of a stack.")
+		}
 		p.BaseRef = *base
 	}
 	if body != nil {
@@ -146,16 +161,22 @@ func (f *Fake) EditPR(n int, base, body *string) error {
 	return nil
 }
 
-func (f *Fake) Enqueue(pr PR, o EnqueueOptions) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.EnqueueErr != nil {
-		return f.EnqueueErr
+func (f *Fake) stackOf(n int) int {
+	for num, prs := range f.Stacks {
+		for _, p := range prs {
+			if p == n {
+				return num
+			}
+		}
 	}
-	f.Enqueued = append(f.Enqueued, pr.Number)
-	e := QueueEntry{PR: pr.Number, State: "QUEUED", Jumped: o.Jump}
-	if o.Jump {
-		f.Jumped = append(f.Jumped, pr.Number)
+	return 0
+}
+
+func (f *Fake) queue(n int, jump bool) {
+	f.Enqueued = append(f.Enqueued, n)
+	e := QueueEntry{PR: n, State: "QUEUED", Jumped: jump}
+	if jump {
+		f.Jumped = append(f.Jumped, n)
 		f.MQ = append([]QueueEntry{e}, f.MQ...)
 	} else {
 		f.MQ = append(f.MQ, e)
@@ -163,7 +184,178 @@ func (f *Fake) Enqueue(pr PR, o EnqueueOptions) error {
 	for i := range f.MQ {
 		f.MQ[i].Position = i + 1
 	}
+}
+
+// Merge queues PR n and, if it is stacked, every open PR below it, as one
+// request. A draft or closed PR, or a moved head, fails the request.
+func (f *Fake) Merge(n int, headSHA string) (MergeRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.MergeErr != nil {
+		return MergeRequest{}, f.MergeErr
+	}
+	p, ok := f.PRs[n]
+	if !ok {
+		return MergeRequest{}, fmt.Errorf("no PR #%d", n)
+	}
+	f.refresh(p)
+	f.Merges = append(f.Merges, n)
+	uuid := fmt.Sprintf("uuid-%d-%d", n, len(f.Merges))
+	fail := func(msg string) (MergeRequest, error) {
+		r := &MergeRequest{UUID: uuid, Status: MergeFailed, Message: msg}
+		f.Requests[uuid] = r
+		return *r, nil
+	}
+	switch {
+	case p.Merged():
+		return MergeRequest{Status: MergeMerged, Message: "Pull request is already merged."}, nil
+	case !p.Open():
+		return fail("Pull request is closed")
+	case p.Draft:
+		return fail("Pull request is in draft")
+	case headSHA != "" && p.HeadSHA != "" && headSHA != p.HeadSHA:
+		return fail("expected head sha does not match")
+	}
+	set := []int{n}
+	if s := f.stackOf(n); s != 0 {
+		set = nil
+		for _, m := range f.Stacks[s] {
+			q := f.PRs[m]
+			if q.Open() {
+				if q.Draft {
+					return fail(fmt.Sprintf("#%d below it is a draft", m))
+				}
+				set = append(set, m)
+			}
+			if m == n {
+				break
+			}
+		}
+	}
+	for _, m := range set {
+		f.queue(m, false)
+	}
+	status := MergeEnqueued
+	if f.MergePending {
+		status = MergePending
+	}
+	r := &MergeRequest{UUID: uuid, Status: status, Message: "Merge request enqueued."}
+	f.Requests[uuid] = r
+	return *r, nil
+}
+
+func (f *Fake) MergeResult(n int, uuid string) (MergeRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.Requests[uuid]
+	if !ok {
+		return MergeRequest{}, fmt.Errorf("no merge request %s for #%d", uuid, n)
+	}
+	return *r, nil
+}
+
+func (f *Fake) Jump(pr PR) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.MergeErr != nil {
+		return f.MergeErr
+	}
+	if f.stackOf(pr.Number) != 0 {
+		return fmt.Errorf("#%d is in a stack, which cannot jump", pr.Number)
+	}
+	f.queue(pr.Number, true)
 	return nil
+}
+
+func (f *Fake) StackOf(n int) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stackOf(n), nil
+}
+
+func (f *Fake) StackPRs(s int) ([]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prs, ok := f.Stacks[s]
+	if !ok {
+		return nil, fmt.Errorf("no stack %d", s)
+	}
+	return append([]int(nil), prs...), nil
+}
+
+// chain checks GitHub's rule: each PR targets the head branch of the one before.
+func (f *Fake) chain(below string, prs []int) error {
+	for _, n := range prs {
+		p, ok := f.PRs[n]
+		if !ok || !p.Open() {
+			return fmt.Errorf("Validation Failed: #%d is not an open pull request", n)
+		}
+		if f.stackOf(n) != 0 {
+			return fmt.Errorf("Validation Failed: #%d is already in a stack", n)
+		}
+		if below != "" && p.BaseRef != below {
+			return fmt.Errorf("Validation Failed: #%d targets %s, not %s", n, p.BaseRef, below)
+		}
+		below = p.HeadRef
+	}
+	return nil
+}
+
+func (f *Fake) CreateStack(prs []int) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(prs) < 2 {
+		return 0, fmt.Errorf("Validation Failed: a stack needs at least 2 pull requests")
+	}
+	if err := f.chain("", prs); err != nil {
+		return 0, err
+	}
+	n := f.next
+	f.next++
+	f.Stacks[n] = append([]int(nil), prs...)
+	f.StackBase[n] = f.PRs[prs[0]].BaseRef
+	return n, nil
+}
+
+func (f *Fake) AddToStack(s int, prs []int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, ok := f.Stacks[s]
+	if !ok {
+		return fmt.Errorf("no stack %d", s)
+	}
+	if err := f.chain(f.PRs[cur[len(cur)-1]].HeadRef, prs); err != nil {
+		return err
+	}
+	f.Stacks[s] = append(cur, prs...)
+	return nil
+}
+
+// LandQueue merges everything in the simulated queue, front first, the way
+// the merge queue does when its checks pass. Like GitHub, it then retargets
+// the open PRs of a stack whose base branch was merged onto the stack's base.
+func (f *Fake) LandQueue() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var merged []int
+	gone := map[string]bool{}
+	for _, e := range f.MQ {
+		if p := f.PRs[e.PR]; p != nil && p.Open() {
+			f.refresh(p)
+			p.State = "MERGED"
+			gone[p.HeadRef] = true
+			merged = append(merged, e.PR)
+		}
+	}
+	f.MQ = nil
+	for s, prs := range f.Stacks {
+		for _, n := range prs {
+			if p := f.PRs[n]; p.Open() && gone[p.BaseRef] {
+				p.BaseRef = f.StackBase[s]
+			}
+		}
+	}
+	return merged
 }
 
 func (f *Fake) ListPool(label string) ([]PR, error) {
@@ -262,17 +454,6 @@ func (f *Fake) AddLabels(n int, labels ...string) error {
 	return nil
 }
 
-// ReviewRequests records who was asked to review each PR.
-func (f *Fake) RequestReviews(n int, users []string) map[string]error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.ReviewRequests == nil {
-		f.ReviewRequests = map[int][]string{}
-	}
-	f.ReviewRequests[n] = append(f.ReviewRequests[n], users...)
-	return nil
-}
-
 func (f *Fake) RemoveLabels(n int, labels ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -283,11 +464,22 @@ func (f *Fake) RemoveLabels(n int, labels ...string) error {
 }
 
 // MarkMerged records that the queue merged PR n, freezing its head SHA.
+// MarkMerged records PR n as merged. If it is in a stack, the open PR that
+// targeted its branch is retargeted onto the stack's base, as GitHub does.
 func (f *Fake) MarkMerged(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if p, ok := f.PRs[n]; ok {
-		f.refresh(p)
-		p.State = "MERGED"
+	p, ok := f.PRs[n]
+	if !ok {
+		return
+	}
+	f.refresh(p)
+	p.State = "MERGED"
+	if st := f.stackOf(n); st != 0 {
+		for _, m := range f.Stacks[st] {
+			if q := f.PRs[m]; q.Open() && q.BaseRef == p.HeadRef {
+				q.BaseRef = f.StackBase[st]
+			}
+		}
 	}
 }

@@ -45,20 +45,34 @@ func (c *Runner) Revert(n int, o RevertOptions) (forge.PR, error) {
 	}
 	targets := []forge.PR{pr}
 	name := fmt.Sprintf("pr-%d", n)
-	if isStack && !o.Only {
-		name = m.Stack
+	// below maps a stack PR to the head of the merged part under it: in a
+	// GitHub stack each part merges on its own, and its branch also holds the
+	// parts below, so its own commits start there.
+	below := map[int]string{}
+	if isStack {
 		sp, err := c.loadStack(m.Stack)
 		if err != nil {
 			return forge.PR{}, err
 		}
-		targets = nil
+		prev := ""
 		for _, p := range sp.prs {
-			if p.Merged() {
-				targets = append(targets, p)
+			if !p.Merged() {
+				continue
 			}
+			below[p.Number] = prev
+			prev = p.HeadSHA
 		}
-		// newest first: higher stack index landed later
-		sort.Slice(targets, func(i, j int) bool { return sp.marks[targets[i].Number].Index > sp.marks[targets[j].Number].Index })
+		if !o.Only {
+			name = m.Stack
+			targets = nil
+			for _, p := range sp.prs {
+				if p.Merged() {
+					targets = append(targets, p)
+				}
+			}
+			// newest first: higher stack index landed later
+			sort.Slice(targets, func(i, j int) bool { return sp.marks[targets[i].Number].Index > sp.marks[targets[j].Number].Index })
+		}
 	}
 	if len(targets) == 0 {
 		return forge.PR{}, fmt.Errorf("nothing from #%d has landed", n)
@@ -84,7 +98,7 @@ func (c *Runner) Revert(n int, o RevertOptions) (forge.PR, error) {
 
 	var plan []landed
 	for _, t := range targets {
-		l, err := c.identify(t)
+		l, err := c.identify(t, below[t.Number])
 		if err != nil {
 			return forge.PR{}, err
 		}
@@ -187,7 +201,7 @@ func (c *Runner) Revert(n int, o RevertOptions) (forge.PR, error) {
 	c.Forge.AddLabels(rpr.Number, LabelRevert)
 	if o.Enqueue {
 		rpr.HeadSHA = head
-		queued, err := c.submit(rpr, trunk)
+		queued, err := c.submit(rpr, trunk, 1)
 		if err != nil {
 			return rpr, fmt.Errorf("opened #%d but could not queue it: %w", rpr.Number, err)
 		}
@@ -200,8 +214,9 @@ func (c *Runner) Revert(n int, o RevertOptions) (forge.PR, error) {
 	return rpr, nil
 }
 
-// identify finds the trunk commits PR t produced.
-func (c *Runner) identify(t forge.PR) (landed, error) {
+// identify finds the trunk commits PR t produced. below, if set, is the head of
+// the stack part under t: t's own commits are the ones after it.
+func (c *Runner) identify(t forge.PR, below string) (landed, error) {
 	r := c.Repo
 	d, err := c.Forge.Details(t.Number)
 	if err != nil {
@@ -232,6 +247,9 @@ func (c *Runner) identify(t forge.PR) (landed, error) {
 	fork, err := r.MergeBase(head, parents[0])
 	if err != nil {
 		return landed{}, err
+	}
+	if below != "" && r.RefExists(below) && r.IsAncestor(below, head) {
+		fork = below
 	}
 	out, _ := r.Run("rev-list", "--reverse", "--no-merges", fork+".."+head)
 	var own []string

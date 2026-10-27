@@ -42,7 +42,7 @@ func TestSchedulerPutsVulnAndSmallFirst(t *testing.T) {
 	f := forge.NewFake()
 	human := addPR(f, "someone/manual", "main", "queued by hand", "", "ana", 200, 9, 3*time.Hour)
 	f.RemoveLabels(human, "stackq:queue")
-	f.Enqueue(forge.PR{Number: human}, forge.EnqueueOptions{})
+	f.Merge(human, "")
 
 	big := addPR(f, "feat/big", "main", "New billing engine", "", "bo", 900, 30, 2*time.Hour)
 	typo := addPR(f, "fix/typo", "main", "Fix typo in README", "", "cy", 2, 1, 5*time.Minute)
@@ -140,23 +140,20 @@ func TestAtomicLandAndRevertGoThroughPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 	top := prBy(t, fx, len(fx.s.Branches)-1)
-	if got := queueOrder(fx.f); len(got) != 1 || got[0] != top.Number {
-		t.Fatalf("only the lander may be queued, queue = %v", got)
+	if len(fx.f.Merges) != 1 || fx.f.Merges[0] != top.Number || len(queueOrder(fx.f)) != len(fx.s.Branches) {
+		t.Fatalf("only the lander may be merged (GitHub queues the parts with it): merges=%v queue=%v", fx.f.Merges, queueOrder(fx.f))
 	}
 	if !fx.f.Labels[part.Number][cfg.Label] {
 		t.Fatal("the stray part should stay in the pool, skipped")
 	}
 
-	if err := fx.queueLands(t, top.Number, "rebase"); err != nil {
-		t.Fatal(err)
-	}
-	fx.f.Dequeue(top.Number)
+	fx.landQueue(t, "rebase")
 	fx.f.RemoveLabels(part.Number, cfg.Label)
 
 	// Something big is already queued; the revert still jumps ahead of it.
 	big := addPR(fx.f, "feat/big", "main", "Big", "", "bo", 900, 30, time.Hour)
 	fx.f.RemoveLabels(big, cfg.Label)
-	fx.f.Enqueue(forge.PR{Number: big}, forge.EnqueueOptions{})
+	fx.f.Merge(big, "")
 
 	rrun := &land.Runner{Repo: testrepo.Clone(t, fx.bare), Forge: fx.f, Remote: "origin", Prio: cfg, Now: func() time.Time { return t0 }}
 	rev, err := rrun.Revert(top.Number, land.RevertOptions{Enqueue: true})

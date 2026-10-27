@@ -1,5 +1,5 @@
 name: stackq
-description: Restack stacked PRs and feed them through GitHub's merge queue, one after another.
+description: Split a big PR into a GitHub stack of small PRs, and land the stack through GitHub's merge queue.
 branding:
   icon: layers
   color: blue
@@ -7,9 +7,10 @@ branding:
 inputs:
   token:
     description: >
-      Token that can push branches, edit PRs and enqueue them. Use a GitHub App
-      token or a PAT: pushes made with GITHUB_TOKEN do not trigger your CI, so
-      a restacked PR would never get the checks the queue needs.
+      Token that can push branches, open and edit PRs, link them as a GitHub
+      stack and merge them (contents and pull-requests write). The built-in
+      GITHUB_TOKEN works, but its pushes start no CI, so the workflow examples
+      start CI themselves; a GitHub App token or PAT avoids that.
     required: true
   command:
     description: >
@@ -22,7 +23,7 @@ inputs:
   args:
     description: >
       Extra arguments for the command, split on spaces (quotes are not
-      interpreted), e.g. `--no-enqueue` for `ci` or `--max-lines 300` for `split`.
+      interpreted), e.g. `--no-enqueue` for `ci` (incremental stacks: don't land the next part) or `--max-lines 300` for `split`.
     required: false
     default: ""
   version:

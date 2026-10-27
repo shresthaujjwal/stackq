@@ -1,17 +1,22 @@
-// Package land drives a stack through GitHub's merge queue. It only needs
-// the PR bodies and a clone, so it runs the same locally and in Actions.
+// Package land lands stacks with GitHub's own stacked pull requests. stackq
+// links a stack's PRs as a GitHub stack when it pushes them; GitHub then shows
+// the stack on every PR, runs trunk's rules and CI for each of them, merges a
+// PR together with every open PR below it as one request, and rebases and
+// retargets the PRs above a merge itself. What stackq adds is the decision of
+// when to land and what:
 //
-// Two landing modes:
+//   - atomic (default): once every part is approved and green, stackq asks
+//     GitHub to merge the top part. GitHub merges the whole stack bottom up as
+//     one request, through the merge queue when trunk has one: trunk gets all
+//     of it or none, with one commit history per part.
+//   - incremental: stackq asks GitHub to merge the lowest open part, and the
+//     next one after it lands.
 //
-//   - atomic (default for new stacks): every part is reviewed on its own,
-//     then the top PR is retargeted to trunk and queued once. The queue
-//     tests and merges the whole stack as a single entry, so trunk never
-//     holds half of it and one revert undoes all of it.
-//   - incremental: the bottom PR is queued; each merge restacks the next
-//     PR onto trunk and queues it.
+// A held (activation) PR sits on top of the stack. stackq never merges it; it
+// tells a human when everything below has landed.
 //
-// In both modes a held (activation) PR is restacked onto trunk after the
-// rest lands but never queued automatically.
+// It needs only the PR bodies, the forge and a clone, so it runs the same
+// locally and in Actions.
 package land
 
 import (
@@ -36,6 +41,9 @@ const (
 	LabelActivation = "stackq:activation"
 	LabelIntegrity  = "stackq:integrity"
 	LabelRevert     = "stackq:revert"
+	// LabelLanded marks the top part of a stack once stackq has reported the
+	// landing, so the report is made once.
+	LabelLanded = "stackq:landed"
 	// LabelReminded marks an activation PR that was reminded about; the time
 	// it was added is when to remind next.
 	LabelReminded = "stackq:reminded"
@@ -45,11 +53,11 @@ type Runner struct {
 	Repo    *git.Repo
 	Forge   forge.Forge
 	Remote  string
-	Enqueue bool // incremental mode: queue the next PR after restacking it
+	Enqueue bool // incremental mode: land the next part after one merges
 	// Atomic gate.
 	MinApprovals    int  // per part; default 1
 	AllowUnreviewed bool // skip the approval gate
-	// KeepBranches leaves the parts' branches after an atomic landing.
+	// KeepBranches leaves the stack's branches after it lands.
 	KeepBranches bool
 	// Prio routes every enqueue through the priority pool (see schedule.go).
 	Prio *prio.Config
@@ -140,36 +148,57 @@ func (sp *stackPRs) anyMerged() bool {
 	return false
 }
 
-// lander is the highest-index PR that is not held back.
-func (sp *stackPRs) lander() (forge.PR, bool) {
-	var best forge.PR
-	found := false
+// parts are the stack's PRs that are not held back, bottom first.
+func (sp *stackPRs) parts() []forge.PR {
+	var out []forge.PR
 	for _, p := range sp.prs {
-		m := sp.marks[p.Number]
-		if m.Hold || p.State == "CLOSED" && !m.Atomic() {
-			continue
-		}
-		if !found || m.Index > sp.marks[best.Number].Index {
-			best, found = p, true
+		if !sp.marks[p.Number].Hold {
+			out = append(out, p)
 		}
 	}
-	return best, found
+	return out
+}
+
+// lander is the top part: merging it lands the whole stack.
+func (sp *stackPRs) lander() (forge.PR, bool) {
+	ps := sp.parts()
+	for i := len(ps) - 1; i >= 0; i-- {
+		if ps[i].State != "CLOSED" {
+			return ps[i], true
+		}
+	}
+	return forge.PR{}, false
+}
+
+// lowestOpen is the lowest open part: the next one an incremental stack lands.
+func (sp *stackPRs) lowestOpen() (forge.PR, bool) {
+	for _, p := range sp.parts() {
+		if p.Open() {
+			return p, true
+		}
+	}
+	return forge.PR{}, false
+}
+
+// landed reports whether every part has merged (held PRs aside).
+func (sp *stackPRs) landed() bool {
+	ps := sp.parts()
+	for _, p := range ps {
+		if !p.Merged() {
+			return false
+		}
+	}
+	return len(ps) > 0
 }
 
 func (sp *stackPRs) nav() []stack.NavEntry {
-	l, ok := sp.lander()
-	landed := ok && l.Merged()
 	var nav []stack.NavEntry
 	for _, p := range sp.prs {
 		m := sp.marks[p.Number]
-		e := stack.NavEntry{Index: m.Index, PR: p.Number, Branch: p.HeadRef, Merged: p.Merged(), Hold: m.Hold}
 		if p.State == "CLOSED" {
-			if !(m.Atomic() && landed && !m.Hold) {
-				continue
-			}
-			e.Closed = true
+			continue // closed without merging: no longer part of the stack
 		}
-		nav = append(nav, e)
+		nav = append(nav, stack.NavEntry{Index: m.Index, PR: p.Number, Branch: p.HeadRef, Merged: p.Merged(), Hold: m.Hold})
 	}
 	return nav
 }
@@ -182,96 +211,100 @@ func (sp *stackPRs) set(p forge.PR) {
 	}
 }
 
-// Land queues a stack. Given any PR of an atomic stack it lands the whole
-// stack; for an incremental stack it queues that PR, which must target trunk.
+// ensureGitHubStack links the stack's open PRs as a GitHub stack if they are
+// not one yet (stacks pushed before stackq used GitHub stacks, or unstacked on
+// GitHub since). It returns the stack number, or 0 when there is one open PR,
+// which needs no stack.
+func (c *Runner) ensureGitHubStack(sp *stackPRs) (int, error) {
+	var open []int
+	for _, p := range sp.prs {
+		if p.Open() {
+			open = append(open, p.Number)
+		}
+	}
+	if len(open) == 0 {
+		return 0, nil
+	}
+	st, err := c.Forge.StackOf(open[0])
+	if err != nil || st != 0 || len(open) < 2 {
+		return st, err
+	}
+	if st, err = c.Forge.CreateStack(open); err != nil {
+		return 0, fmt.Errorf("its PRs are not a GitHub stack, and linking them failed: %w", err)
+	}
+	c.logf("⧉ linked %s as GitHub stack %d", prNums(open), st)
+	return st, nil
+}
+
+func prNums(prs []int) string {
+	var out []string
+	for _, n := range prs {
+		out = append(out, fmt.Sprintf("#%d", n))
+	}
+	return strings.Join(out, ", ")
+}
+
+// Land lands what PR n stands for. For a stack PR that is the whole stack
+// (atomic), or PR n and every open part below it (incremental: GitHub merges
+// a stacked PR together with what is below it). A held PR is merged only when
+// named. Any other PR is merged on its own.
 func (c *Runner) Land(n int) error {
 	pr, err := c.Forge.GetPR(n)
 	if err != nil {
 		return err
 	}
-	m, isStack := c.markerOf(pr)
-	if isStack && m.Atomic() {
-		return c.landAtomic(m)
+	if m, ok := c.markerOf(pr); ok {
+		upTo := 0
+		if !m.Atomic() || m.Hold {
+			upTo = n
+		}
+		if m.Hold {
+			c.logf("#%d is the activation PR; landing it because you asked", n)
+		}
+		return c.attempt(m, false, upTo)
 	}
 	if !pr.Open() {
 		return fmt.Errorf("#%d is %s", n, strings.ToLower(pr.State))
 	}
-	if isStack && m.Hold {
-		c.logf("#%d is the activation PR; queueing it because you asked", n)
-	}
-	if isStack && pr.BaseRef != m.Trunk {
-		return fmt.Errorf("#%d targets %s, not %s; land the PRs below it first", n, pr.BaseRef, m.Trunk)
-	}
-	c.Forge.RemoveLabels(n, LabelBlocked, LabelConflict)
-	trunk := pr.BaseRef
-	if isStack {
-		trunk = m.Trunk
-	}
-	queued, err := c.submit(pr, trunk)
+	c.Forge.RemoveLabels(n, LabelBlocked)
+	queued, err := c.submit(pr, pr.BaseRef, 1)
 	if err != nil {
 		return err
 	}
-	switch {
-	case !c.prioOn():
-		c.logf("⇢ #%d is in the merge queue (or will join it when its checks pass)", n)
-	case !queued:
+	if !queued {
 		c.logf("⧗ #%d stays in the priority pool until a pass queues it (the next review, finished CI run or timer tick)", n)
 	}
 	return nil
 }
 
-// landAtomic gates every part, retargets the lander to trunk and queues it
-// as one entry carrying the whole stack.
-func (c *Runner) landAtomic(m stack.Marker) error { return c.attemptAtomic(m, false) }
-
-// AutoLand lands every open atomic stack whose parts are all approved and
-// green, and that isn't landing already. It is meant to run on every approval,
-// finished CI run and timer tick, so a stack that isn't ready is left alone
-// without a comment, a label or an error.
+// AutoLand lands every open stack that is ready and not landing already:
+// atomic stacks as a whole, incremental ones part by part. It is meant to run
+// on every approval, finished CI run and timer tick, so a stack that isn't
+// ready is left alone without a comment, a label or an error.
 func (c *Runner) AutoLand() error {
-	open, err := c.Forge.ListPRs("open")
+	names, byName, err := c.openStacks()
 	if err != nil {
 		return err
 	}
-	byName := map[string]stack.Marker{}
-	var names []string
-	for _, p := range open {
-		m, ok := c.markerOf(p)
-		if !ok || !m.Atomic() {
-			continue
-		}
-		if _, dup := byName[m.Stack]; !dup {
-			byName[m.Stack] = m
-			names = append(names, m.Stack)
-		}
-	}
-	sort.Strings(names)
 	var errs []error
 	for _, name := range names {
-		if err := c.attemptAtomic(byName[name], true); err != nil {
+		if err := c.attempt(byName[name], true, 0); err != nil {
 			errs = append(errs, fmt.Errorf("stack %s: %w", name, err))
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// FinishLanded cleans up every atomic stack whose lander has merged but whose
-// parts or held PR were never tidied: it runs AfterMerge for the lander. A
-// merge made by the merge queue or auto-merge on behalf of the built-in
-// GITHUB_TOKEN does not start the "PR closed and merged" workflow (GitHub does
-// not run workflows for events that token causes), so without this the parts
-// stay open and the held PR keeps pointing at a deleted branch. Safe to run on
-// every tick: once a stack is tidy it does nothing.
-func (c *Runner) FinishLanded() error {
+func (c *Runner) openStacks() ([]string, map[string]stack.Marker, error) {
 	open, err := c.Forge.ListPRs("open")
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	byName := map[string]stack.Marker{}
 	var names []string
 	for _, p := range open {
 		m, ok := c.markerOf(p)
-		if !ok || !m.Atomic() {
+		if !ok {
 			continue
 		}
 		if _, dup := byName[m.Stack]; !dup {
@@ -280,47 +313,7 @@ func (c *Runner) FinishLanded() error {
 		}
 	}
 	sort.Strings(names)
-
-	// A held PR that could not be rebased is already labeled and commented;
-	// don't report the same conflict on every tick.
-	conflicted := map[int]bool{}
-	if pool, err := c.Forge.ListPool(LabelConflict); err == nil {
-		for _, p := range pool {
-			conflicted[p.Number] = true
-		}
-	}
-
-	var errs []error
-	for _, name := range names {
-		sp, err := c.loadStack(name)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		lander, ok := sp.lander()
-		if !ok || !lander.Merged() {
-			continue
-		}
-		pending := false
-		for _, p := range sp.prs {
-			pm := sp.marks[p.Number]
-			switch {
-			case !p.Open() || p.Number == lander.Number:
-			case !pm.Hold:
-				pending = true // a part that should have been closed
-			case p.BaseRef != pm.Trunk && !conflicted[p.Number]:
-				pending = true // the held PR still targets a stack branch
-			}
-		}
-		if !pending {
-			continue
-		}
-		c.logf("- stack %s: #%d merged but its cleanup never ran; finishing it", name, lander.Number)
-		if err := c.AfterMerge(lander.Number); err != nil {
-			errs = append(errs, fmt.Errorf("stack %s: %w", name, err))
-		}
-	}
-	return errors.Join(errs...)
+	return names, byName, nil
 }
 
 // queued reports whether GitHub's queue for trunk already holds PR n.
@@ -351,45 +344,80 @@ func (c *Runner) labeled(n int, label string) bool {
 	return false
 }
 
-// Where a lander that targets trunk stands, as landingState reports it.
+// Where a stack that stackq asked to land stands, as landingState reports it.
 const (
-	stateQueued    = "queued"     // in the merge queue
-	statePool      = "pool"       // waiting in the priority pool
-	stateAutoMerge = "auto-merge" // auto-merge on, waiting for its requirements
-	stateGone      = "gone"       // none of the above, and not merged
-	stateUnknown   = "unknown"    // could not tell
+	stateIdle    = "idle"    // stackq has not asked GitHub to land it
+	statePending = "pending" // GitHub accepted the merge request and is working on it
+	stateQueued  = "queued"  // in the merge queue
+	statePool    = "pool"    // waiting in the priority pool
+	stateFailed  = "failed"  // GitHub could not do the merge it was asked for
+	stateGone    = "gone"    // it was queued, and left without merging
+	stateUnknown = "unknown" // could not tell, or it merged meanwhile
 )
 
-// landingState reports where a lander that targets trunk stands. GitHub sends
-// a dequeued event when the queue drops a PR, but the run for it can be lost:
-// the workflows share one concurrency group, and a newer pending run replaces
-// an older one. stateGone lets the next tick notice. Any doubt (the queue
-// cannot be read, a lookup fails, the PR merged meanwhile) is stateUnknown.
-func (c *Runner) landingState(lander forge.PR, trunk string) string {
-	if c.prioOn() && c.labeled(lander.Number, c.Prio.Label) {
-		return statePool
+// requestTag records the merge request stackq made in the target PR's status
+// section, so later runs can ask GitHub how it went.
+const requestTag = "<!-- stackq:merge-request "
+
+func withRequest(status, uuid string) string {
+	if uuid == "" {
+		uuid = "-"
 	}
-	q, err := c.Forge.Queue(trunk)
-	if err != nil {
-		return stateUnknown
+	return status + "\n" + requestTag + uuid + " -->"
+}
+
+// requestOf returns the merge request recorded in a PR body: ok is false when
+// none is, uuid is empty when GitHub gave none (it answered at once).
+func requestOf(body string) (uuid string, ok bool) {
+	i := strings.Index(body, requestTag)
+	if i < 0 {
+		return "", false
 	}
-	for _, e := range q {
-		if e.PR == lander.Number {
-			return stateQueued
+	rest := body[i+len(requestTag):]
+	if j := strings.Index(rest, " -->"); j >= 0 {
+		rest = rest[:j]
+	}
+	if rest == "-" {
+		rest = ""
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// landingState reports where target stands. GitHub's merge request is the
+// first source: pending while GitHub prepares the merge, failed with GitHub's
+// reason (a rule the PR does not meet, a conflict), enqueued once it joined
+// the queue. After that the queue says whether it is still there. GitHub sends
+// a dequeued event when the queue drops a PR, but the run for it can be lost,
+// so stateGone lets the next tick notice. Any doubt is stateUnknown.
+func (c *Runner) landingState(target forge.PR, trunk string) (string, string) {
+	if c.prioOn() && c.labeled(target.Number, c.Prio.Label) {
+		return statePool, ""
+	}
+	uuid, asked := requestOf(target.Body)
+	if !asked {
+		return stateIdle, ""
+	}
+	if c.queued(target.Number, trunk) {
+		return stateQueued, ""
+	}
+	if uuid != "" {
+		r, err := c.Forge.MergeResult(target.Number, uuid)
+		switch {
+		case err != nil:
+			return stateUnknown, ""
+		case r.Status == forge.MergePending:
+			return statePending, ""
+		case r.Status == forge.MergeFailed:
+			return stateFailed, r.Message
+		case r.Status == forge.MergeMerged:
+			return stateUnknown, ""
 		}
 	}
-	d, err := c.Forge.Details(lander.Number)
-	switch {
-	case err != nil || d.MergeCommit != "":
-		return stateUnknown
-	case d.AutoMerge:
-		return stateAutoMerge
-	}
 	// Last, so a merge that happened while we looked is seen.
-	if pr, err := c.Forge.GetPR(lander.Number); err != nil || !pr.Open() {
-		return stateUnknown
+	if pr, err := c.Forge.GetPR(target.Number); err != nil || !pr.Open() {
+		return stateUnknown, ""
 	}
-	return stateGone
+	return stateGone, ""
 }
 
 // setStatus writes the landing status into the PR's body (stack.MergeStatus),
@@ -406,30 +434,25 @@ func (c *Runner) setStatus(pr forge.PR, status string) {
 }
 
 func statusWaiting(problems []string) string {
-	return "⏳ **Not landing yet.** The stack lands as one entry once nothing below is left:\n\n- " + strings.Join(problems, "\n- ")
+	return "⏳ **Not landing yet.** stackq asks GitHub to land the stack once nothing below is left:\n\n- " + strings.Join(problems, "\n- ")
 }
 
 func statusLanding(parts int) string {
-	return fmt.Sprintf("🚀 **Landing.** This PR carries all %s into the merge queue as one entry.", plural.N(parts, "part"))
-}
-
-// statusAutoMerge is for a lander GitHub would not queue yet: auto-merge is on
-// and waits for what GitHub requires of the PR itself. With the built-in token
-// that is usually a required check that only the PR's own pull_request run can
-// satisfy, and that run is held for approval.
-func statusAutoMerge(parts int) string {
-	return fmt.Sprintf("⏳ **Waiting for GitHub's requirements.** This PR carries all %s. GitHub would not put it in the merge queue yet, so auto-merge is on and queues it once the PR itself meets them: required checks passed, reviews given. "+
-		"If CI shows \"awaiting approval\" on this PR, approve that run. A required check is only met by CI that a pull request or the queue started, not by the CI stackq starts with the built-in token (see the README).", plural.N(parts, "part"))
+	if parts == 1 {
+		return "🚀 **Landing.** GitHub is merging this PR, through the merge queue if trunk has one."
+	}
+	return fmt.Sprintf("🚀 **Landing.** GitHub is merging %s bottom up as one request, through the merge queue if trunk has one.", plural.N(parts, "PR"))
 }
 
 func statusPool(parts int) string {
-	return fmt.Sprintf("⧗ **Waiting in the priority pool** for a merge-queue slot. This PR carries all %s.", plural.N(parts, "part"))
+	return fmt.Sprintf("⧗ **Waiting in the priority pool** for a merge-queue slot. Landing this PR merges %s.", plural.N(parts, "PR"))
 }
 
-// attemptAtomic gates and queues an atomic stack. With auto set it is quiet:
-// anything that stops the landing is logged and returns nil, because the next
-// event will try again.
-func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
+// attempt gates and lands a stack: the whole of it (atomic), or up to upTo,
+// or (incremental) its lowest open part. With auto set it is quiet: anything
+// that stops the landing is logged and returns nil, because the next event will
+// try again.
+func (c *Runner) attempt(m stack.Marker, auto bool, upTo int) error {
 	sp, err := c.loadStack(m.Stack)
 	if err != nil {
 		return err
@@ -444,50 +467,66 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 		}
 		return err
 	}
+	var target forge.PR
+	var ok bool
+	switch {
+	case upTo != 0:
+		for _, p := range sp.prs {
+			if p.Number == upTo {
+				target, ok = p, p.Open()
+			}
+		}
+	case m.Atomic():
+		target, ok = sp.lander()
+		ok = ok && target.Open()
+	default:
+		target, ok = sp.lowestOpen()
+	}
+	if !ok {
+		if !auto {
+			return fmt.Errorf("stack %s has nothing open to land", m.Stack)
+		}
+		return nil
+	}
+
+	// What GitHub merges with target: it and every open PR below it.
 	var parts []forge.PR
 	for _, p := range sp.prs {
-		pm := sp.marks[p.Number]
-		switch {
-		case pm.Hold:
-		case p.Open():
+		if p.Open() && sp.marks[p.Number].Index <= sp.marks[target.Number].Index {
 			parts = append(parts, p)
-		case p.State == "CLOSED":
-			err := fmt.Errorf("#%d (part %d) was closed without merging; reopen it or rebuild the stack", p.Number, pm.Index)
-			if auto {
-				c.logf("- stack %s: %v", m.Stack, err)
-				return nil
-			}
-			return err
 		}
 	}
-	if len(parts) == 0 {
-		if auto {
-			return nil
-		}
-		return fmt.Errorf("stack %s has nothing left to land", m.Stack)
-	}
-	lander := parts[len(parts)-1]
-	// Once the lander targets trunk the stack is landing; don't queue it twice.
-	if auto && lander.BaseRef == m.Trunk && (len(parts) > 1 || c.queued(lander.Number, m.Trunk)) {
-		if c.labeled(lander.Number, LabelBlocked) {
-			c.logf("- stack %s is paused: #%d is labeled %s; fix it, then run stackq land --pr %d", m.Stack, lander.Number, LabelBlocked, lander.Number)
-			return nil
-		}
-		switch c.landingState(lander, m.Trunk) {
-		case stateGone:
-			if len(parts) > 1 {
-				c.logf("! #%d left the merge queue without merging, and no dequeued run handled it", lander.Number)
-				return c.Dequeued(lander.Number)
-			}
-		case statePool:
-			c.setStatus(lander, statusPool(len(parts)))
-		case stateQueued:
-			c.setStatus(lander, statusLanding(len(parts)))
-		case stateAutoMerge:
-			c.setStatus(lander, statusAutoMerge(len(parts))+c.askForLanderReview(lander, parts))
-		}
-		c.logf("- stack %s is already landing (#%d)", m.Stack, lander.Number)
+
+	if c.labeled(target.Number, LabelBlocked) && auto {
+		c.logf("- stack %s is paused: #%d is labeled %s; fix it, then run stackq land --pr %d", m.Stack, target.Number, LabelBlocked, target.Number)
 		return nil
+	}
+	switch state, why := c.landingState(target, m.Trunk); state {
+	case statePool:
+		c.setStatus(target, withRequestKept(target.Body, statusPool(len(parts))))
+		c.logf("- stack %s is waiting in the priority pool (#%d)", m.Stack, target.Number)
+		return nil
+	case stateQueued, statePending, stateUnknown:
+		c.logf("- stack %s is already landing (#%d)", m.Stack, target.Number)
+		return nil
+	case stateFailed:
+		if auto {
+			return c.pause(target, m, "GitHub could not merge it: "+why)
+		}
+	case stateGone:
+		if auto {
+			c.logf("! #%d left the merge queue without merging, and no dequeued run handled it", target.Number)
+			return c.Dequeued(target.Number)
+		}
+	}
+
+	st, err := c.ensureGitHubStack(sp)
+	if err != nil {
+		if auto {
+			c.logf("- stack %s: %v", m.Stack, err)
+			return nil
+		}
+		return fmt.Errorf("stack %s: %w", m.Stack, err)
 	}
 
 	fetch := []string{"fetch", "--quiet", c.Remote, "+refs/heads/" + m.Trunk + ":refs/remotes/" + c.remoteRef(m.Trunk)}
@@ -515,6 +554,9 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 			return err
 		}
 		idx := sp.marks[p.Number].Index
+		if p.Draft && !sp.marks[p.Number].Hold {
+			problems = append(problems, fmt.Sprintf("part %d #%d is a draft", idx, p.Number))
+		}
 		if len(d.ChangesRequested) > 0 {
 			problems = append(problems, fmt.Sprintf("part %d #%d: changes requested by %s", idx, p.Number, strings.Join(d.ChangesRequested, ", ")))
 		}
@@ -536,7 +578,7 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 		if i > 0 {
 			below, above := c.remoteRef(parts[i-1].HeadRef), c.remoteRef(p.HeadRef)
 			if !c.Repo.IsAncestor(below, above) {
-				problems = append(problems, fmt.Sprintf("part %d #%d is not stacked on part %d; run stackq sync && stackq push",
+				problems = append(problems, fmt.Sprintf("part %d #%d is not on top of part %d; use **Rebase stack** on GitHub, or stackq sync && stackq push",
 					idx, p.Number, sp.marks[parts[i-1].Number].Index))
 			}
 		}
@@ -548,385 +590,89 @@ func (c *Runner) attemptAtomic(m stack.Marker, auto bool) error {
 	}
 	if len(problems) > 0 && auto {
 		c.logf("- stack %s is not ready to land: %s", m.Stack, strings.Join(problems, "; "))
-		c.setStatus(lander, statusWaiting(problems))
+		c.setStatus(target, statusWaiting(problems))
 		return nil
 	}
 	if len(problems) > 0 {
 		msg := "stack " + m.Stack + " is not ready to land:\n  - " + strings.Join(problems, "\n  - ")
-		c.Forge.Comment(lander.Number, "⏸️ **Not landing yet.** Every part must be approved and green before the stack lands as one:\n\n- "+
+		c.Forge.Comment(target.Number, "⏸️ **Not landing yet.** Every PR GitHub would merge must be approved and green first:\n\n- "+
 			strings.Join(problems, "\n- ")+"\n\nFix these, then run `stackq land` again.")
-		c.Forge.AddLabels(lander.Number, LabelBlocked)
+		c.Forge.AddLabels(target.Number, LabelBlocked)
 		return errors.New(msg)
 	}
 
-	if lander.BaseRef != m.Trunk {
-		base := m.Trunk
-		if err := c.Forge.EditPR(lander.Number, &base, nil); err != nil {
-			return err
-		}
-		lander.BaseRef = m.Trunk
-		c.logf("~ #%d now targets %s and carries all %s", lander.Number, m.Trunk, plural.N(len(parts), "part"))
-	}
-	head, err := c.Repo.RevParse(c.remoteRef(lander.HeadRef))
+	head, err := c.Repo.RevParse(c.remoteRef(target.HeadRef))
 	if err != nil {
 		return err
 	}
-	lander.HeadSHA = head
+	target.HeadSHA = head
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "🚀 **Landing stack `%s` atomically.** This PR now targets `%s` and carries all %s as a single merge-queue entry. "+
-		"Trunk gets either the whole stack or none of it.\n\n| Part | PR | Approved by | Checks |\n|---|---|---|---|\n", m.Stack, m.Trunk, plural.N(len(parts), "part"))
+	if len(parts) > 1 {
+		fmt.Fprintf(&b, "🚀 **Landing stack `%s`.** stackq asked GitHub to merge this PR. As GitHub stack %d, that merges these %s into `%s` bottom up, as one request: all of them or none.\n\n",
+			m.Stack, st, plural.N(len(parts), "PR"), m.Trunk)
+	} else {
+		fmt.Fprintf(&b, "🚀 **Landing** part %d of stack `%s` into `%s`.\n\n", sp.marks[target.Number].Index, m.Stack, m.Trunk)
+	}
+	b.WriteString("| Part | PR | Approved by | Checks |\n|---|---|---|---|\n")
 	for _, r := range rows {
 		fmt.Fprintf(&b, "| %d | #%d | %s | %s |\n", sp.marks[r.pr.Number].Index, r.pr.Number, r.approvers, r.checks)
 	}
-	fmt.Fprintf(&b, "\nRoll back after merge with `stackq revert --pr %d`.", lander.Number)
-	c.Forge.Comment(lander.Number, b.String())
+	fmt.Fprintf(&b, "\nRoll back after merge with `stackq revert --pr %d`.", target.Number)
+	c.Forge.Comment(target.Number, b.String())
 	for _, p := range parts {
 		c.Forge.AddLabels(p.Number, LabelLanding)
 	}
-	c.Forge.RemoveLabels(lander.Number, LabelBlocked, LabelConflict)
-	queued, err := c.submit(lander, m.Trunk)
+	c.Forge.RemoveLabels(target.Number, LabelBlocked, LabelConflict)
+	queued, err := c.submit(target, m.Trunk, len(parts))
 	if err != nil {
 		return err
 	}
 	if queued {
-		c.logf("⇢ #%d carries the whole stack (%s) into the queue", lander.Number, plural.N(len(parts), "part"))
-		c.setStatus(lander, statusLanding(len(parts)))
+		c.logf("⇢ asked GitHub to merge #%d (%s)", target.Number, plural.N(len(parts), "PR"))
 	} else {
-		c.logf("⧗ #%d carries the whole stack (%s) and stays in the priority pool until a pass queues it", lander.Number, plural.N(len(parts), "part"))
-		c.setStatus(lander, statusPool(len(parts)))
+		c.logf("⧗ #%d (%s) stays in the priority pool until a pass queues it", target.Number, plural.N(len(parts), "PR"))
 	}
 	return nil
 }
 
-// AfterMerge reacts to a merged stack PR: restack its children onto trunk,
-// queue the next one (incremental), finish an atomic landing, and announce
-// the activation PR once everything else is on trunk.
-func (c *Runner) AfterMerge(n int) error {
-	r := c.Repo
-	pr, err := c.Forge.GetPR(n)
-	if err != nil {
-		return err
+// withRequestKept keeps the merge request tag of body under a new status.
+func withRequestKept(body, status string) string {
+	if uuid, ok := requestOf(body); ok {
+		return withRequest(status, uuid)
 	}
-	if !pr.Merged() {
-		c.logf("#%d is not merged; nothing to do", n)
-		return nil
-	}
-	m, ok := c.markerOf(pr)
-	if !ok {
-		c.logf("#%d is not part of a stackq stack; nothing to do", n)
-		return nil
-	}
-	sp, err := c.loadStack(m.Stack)
-	if err != nil {
-		return err
-	}
-	pr.State = "MERGED" // in case the listing lags behind the event
-	sp.set(pr)
-	lander, _ := sp.lander()
-	isLander := !m.Hold && lander.Number == pr.Number
-	restOnTrunk := isLander // nothing but held PRs remain above
-
-	var children []forge.PR
-	for _, p := range sp.prs {
-		if p.Open() && sp.marks[p.Number].Parent == pr.HeadRef {
-			children = append(children, p)
-		}
-	}
-
-	trunk := m.Trunk
-	var failed []string
-	done := map[int]bool{}
-	if len(children) > 0 {
-		fetch := []string{"fetch", "--quiet", c.Remote, "+refs/heads/" + trunk + ":refs/remotes/" + c.remoteRef(trunk)}
-		for _, ch := range children {
-			fetch = append(fetch, "+refs/heads/"+ch.HeadRef+":refs/remotes/"+c.remoteRef(ch.HeadRef))
-		}
-		if _, err := r.Run(fetch...); err != nil {
-			return err
-		}
-		onto, err := r.RevParse(c.remoteRef(trunk))
-		if err != nil {
-			return err
-		}
-		for _, ch := range children {
-			cm := sp.marks[ch.Number]
-			old, err := r.RevParse(c.remoteRef(ch.HeadRef))
-			if err != nil {
-				return err
-			}
-			// The child was built on the parent's pre-merge head; replay only
-			// the commits after it. Fall back to a plain rebase, which still
-			// drops commits whose patches are already in trunk.
-			upstream := ""
-			if pr.HeadSHA != "" && r.IsAncestor(pr.HeadSHA, old) {
-				upstream = pr.HeadSHA
-			}
-			newSHA, err := r.RebaseCommit(old, onto, upstream, ch.HeadRef)
-			if err != nil {
-				var ce *git.ConflictError
-				if !errors.As(err, &ce) {
-					return err
-				}
-				c.reportConflict(ch, pr, trunk, ce)
-				failed = append(failed, fmt.Sprintf("#%d", ch.Number))
-				continue
-			}
-			if newSHA != old {
-				lease := fmt.Sprintf("--force-with-lease=refs/heads/%s:%s", ch.HeadRef, old)
-				if _, err := r.Run("push", "--quiet", lease, c.Remote, newSHA+":refs/heads/"+ch.HeadRef); err != nil {
-					return fmt.Errorf("push %s: %w", ch.HeadRef, err)
-				}
-			}
-			cm.Parent = trunk
-			sp.marks[ch.Number] = cm
-			ch.BaseRef, ch.HeadSHA = trunk, newSHA
-			ch.Body = stack.MergeBody(ch.Body, stack.RenderBlock(cm, sp.nav()))
-			sp.set(ch)
-			base, body := trunk, ch.Body
-			if err := c.Forge.EditPR(ch.Number, &base, &body); err != nil {
-				return err
-			}
-			done[ch.Number] = true
-			c.logf("↻ #%d %s: rebased onto %s (%s) and retargeted", ch.Number, ch.HeadRef, trunk, git.Short(newSHA))
-
-			switch {
-			case cm.Hold:
-				// A held PR always sits on the last part, so everything
-				// else is on trunk now.
-				c.Forge.AddLabels(ch.Number, LabelActivation)
-				c.Forge.Comment(ch.Number, fmt.Sprintf("🔒 The rest of stack `%s` is on `%s`. This activation PR is rebased and ready, "+
-					"but stackq will not queue it: merge it (or `stackq land --pr %d`) when you are ready to switch the feature on.",
-					m.Stack, trunk, ch.Number))
-				c.logf("🔒 #%d (activation) is ready and left for a human", ch.Number)
-			case m.Atomic() && !isLander:
-				// Keep the rest of the chain stacked so it can still land as one.
-				if err := c.cascade(sp, ch.HeadRef, old, newSHA); err != nil {
-					var ce *git.ConflictError
-					if !errors.As(err, &ce) {
-						return err
-					}
-					failed = append(failed, ce.Branch)
-				}
-				c.Forge.Comment(ch.Number, fmt.Sprintf("⚠️ #%d was merged on its own, although stack `%s` lands atomically. "+
-					"The rest of the stack was rebased onto `%s` but nothing was queued. Run `stackq land` to land the remainder together.",
-					n, m.Stack, trunk))
-			case c.Enqueue && !m.Atomic():
-				queued, err := c.submit(ch, trunk)
-				if err != nil {
-					c.Forge.Comment(ch.Number, fmt.Sprintf("⚠️ stackq restacked this PR after #%d merged, but could not queue it:\n\n```\n%v\n```\n\nRun `stackq land --pr %d` once that is sorted out.", n, err, ch.Number))
-					c.Forge.AddLabels(ch.Number, LabelBlocked)
-					failed = append(failed, fmt.Sprintf("#%d (enqueue)", ch.Number))
-					continue
-				}
-				if queued {
-					c.logf("⇢ #%d queued", ch.Number)
-				} else {
-					c.logf("⧗ #%d is in the priority pool until a pass queues it", ch.Number)
-				}
-			}
-		}
-	} else {
-		c.logf("stack %s: #%d had no open PR above it", m.Stack, n)
-	}
-	if !m.Atomic() {
-		restOnTrunk = true
-		for _, p := range sp.prs {
-			if pm := sp.marks[p.Number]; !pm.Hold && !p.Merged() {
-				restOnTrunk = false
-			}
-		}
-	}
-
-	if isLander && m.Atomic() {
-		if err := c.finishAtomic(sp, pr, m, len(failed) == 0); err != nil {
-			return err
-		}
-	}
-	if err := c.refreshNav(sp, done); err != nil {
-		return err
-	}
-	if restOnTrunk {
-		if err := c.reportLanded(sp, pr, m); err != nil {
-			return err
-		}
-	}
-	if len(failed) > 0 {
-		return fmt.Errorf("stack %s paused at %s", m.Stack, strings.Join(failed, ", "))
-	}
-	return nil
+	return status
 }
 
-// cascade rebases every open descendant of parent from oldTip onto newTip
-// and pushes it, keeping the chain intact. Bases don't change.
-func (c *Runner) cascade(sp *stackPRs, parent, oldTip, newTip string) error {
-	r := c.Repo
-	for _, p := range sp.prs {
-		if !p.Open() || sp.marks[p.Number].Parent != parent {
-			continue
+// merge asks GitHub to merge target and records the request in its status
+// section. A request GitHub turns down at once pauses the stack.
+func (c *Runner) merge(target forge.PR, parts int) error {
+	r, err := c.Forge.Merge(target.Number, target.HeadSHA)
+	if err != nil {
+		return err
+	}
+	if r.Status == forge.MergeFailed {
+		if m, ok := c.markerOf(target); ok {
+			return c.pause(target, m, "GitHub could not merge it: "+r.Message)
 		}
-		if _, err := r.Run("fetch", "--quiet", c.Remote, "+refs/heads/"+p.HeadRef+":refs/remotes/"+c.remoteRef(p.HeadRef)); err != nil {
-			return err
-		}
-		old, err := r.RevParse(c.remoteRef(p.HeadRef))
-		if err != nil {
-			return err
-		}
-		upstream := ""
-		if r.IsAncestor(oldTip, old) {
-			upstream = oldTip
-		}
-		newSHA, err := r.RebaseCommit(old, newTip, upstream, p.HeadRef)
-		if err != nil {
-			var ce *git.ConflictError
-			if errors.As(err, &ce) {
-				c.reportConflict(p, forge.PR{Number: 0}, parent, ce)
-			}
-			return err
-		}
-		if newSHA != old {
-			lease := fmt.Sprintf("--force-with-lease=refs/heads/%s:%s", p.HeadRef, old)
-			if _, err := r.Run("push", "--quiet", lease, c.Remote, newSHA+":refs/heads/"+p.HeadRef); err != nil {
-				return fmt.Errorf("push %s: %w", p.HeadRef, err)
-			}
-			c.logf("↻ #%d %s: restacked onto %s", p.Number, p.HeadRef, parent)
-		}
-		if err := c.cascade(sp, p.HeadRef, old, newSHA); err != nil {
-			return err
+		return fmt.Errorf("GitHub could not merge #%d: %s", target.Number, r.Message)
+	}
+	if _, ok := c.markerOf(target); ok {
+		target.Body = stack.MergeStatus(target.Body, withRequest(statusLanding(parts), r.UUID))
+		if err := c.Forge.EditPR(target.Number, nil, &target.Body); err != nil {
+			c.logf("! could not record the merge request on #%d: %v", target.Number, err)
 		}
 	}
 	return nil
 }
 
-// finishAtomic closes the parts that landed inside the lander and deletes
-// their branches.
-func (c *Runner) finishAtomic(sp *stackPRs, lander forge.PR, m stack.Marker, childrenOK bool) error {
-	r := c.Repo
-	var parts []forge.PR
-	for _, p := range sp.prs {
-		if pm := sp.marks[p.Number]; !pm.Hold && p.Number != lander.Number {
-			parts = append(parts, p)
-		}
-	}
-	for _, p := range parts {
-		if !p.Open() {
-			continue
-		}
-		c.Forge.Comment(p.Number, fmt.Sprintf("✅ Landed on `%s` as part of stack `%s`, inside #%d (one merge-queue entry). "+
-			"Closing this part. Roll back the whole stack with `stackq revert --pr %d`.", m.Trunk, m.Stack, lander.Number, lander.Number))
-		if err := c.Forge.ClosePR(p.Number); err != nil {
-			return err
-		}
-		c.Forge.RemoveLabels(p.Number, LabelLanding)
-		p.State = "CLOSED"
-		sp.set(p)
-		c.logf("✕ closed #%d (landed inside #%d)", p.Number, lander.Number)
-	}
-	c.Forge.RemoveLabels(lander.Number, LabelLanding, LabelBlocked)
-	c.setStatus(lander, "")
-
-	if !c.KeepBranches {
-		// The lander's branch is the base of held PRs until they are
-		// retargeted; keep it if that failed.
-		toDelete := append([]forge.PR{}, parts...)
-		if childrenOK {
-			toDelete = append(toDelete, lander)
-		}
-		for _, p := range toDelete {
-			ref := "refs/heads/" + p.HeadRef
-			if _, err := r.Run("fetch", "--quiet", c.Remote, "+"+ref+":refs/remotes/"+c.remoteRef(p.HeadRef)); err != nil {
-				continue // already gone (e.g. auto-deleted head branch)
-			}
-			sha, err := r.RevParse(c.remoteRef(p.HeadRef))
-			if err != nil {
-				continue
-			}
-			if _, err := r.Run("push", "--quiet", fmt.Sprintf("--force-with-lease=%s:%s", ref, sha), c.Remote, ":"+ref); err != nil {
-				c.logf("! could not delete %s: %v", p.HeadRef, err)
-				continue
-			}
-			c.logf("🗑 deleted %s", p.HeadRef)
-		}
-	}
-
-	d, err := c.Forge.Details(lander.Number)
-	if err != nil {
-		return err
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "✅ **Stack `%s` landed atomically** on `%s`: %s in one merge-queue entry.\n\n", m.Stack, m.Trunk, plural.N(len(parts)+1, "part"))
-	if d.MergeCommit != "" {
-		fmt.Fprintf(&b, "Trunk commit: `%s`\n\n", git.Short(d.MergeCommit))
-	}
-	fmt.Fprintf(&b, "**Rollback:** if the change is behind a feature flag, turning the flag off is the fastest fix. "+
-		"To remove the code, run `stackq revert --pr %d` (or the stackq workflow with command `revert`): it opens one PR that reverts the whole stack.", lander.Number)
-	return c.Forge.Comment(lander.Number, b.String())
-}
-
-func (c *Runner) reportConflict(ch, parent forge.PR, trunk string, ce *git.ConflictError) {
-	var b strings.Builder
-	why := ""
-	if parent.Number > 0 {
-		why = fmt.Sprintf(" after #%d merged", parent.Number)
-	}
-	fmt.Fprintf(&b, "⚠️ **stackq could not restack this PR**%s: rebasing onto `%s` conflicts in\n\n", why, trunk)
-	for _, f := range ce.Files {
-		fmt.Fprintf(&b, "- `%s`\n", f)
-	}
-	fmt.Fprintf(&b, "\nThe stack is paused here. To fix it locally:\n\n```sh\n"+
-		"stackq sync      # stops at the conflict and prints the exact rebase command to run\n"+
-		"# run it, resolve, git rebase --continue, then\nstackq sync && stackq push && stackq land\n```\n")
-	c.Forge.Comment(ch.Number, b.String())
-	c.Forge.AddLabels(ch.Number, LabelConflict)
-	c.logf("✗ #%d conflicts with %s: %s", ch.Number, trunk, strings.Join(ce.Files, ", "))
-}
-
-// reportLanded tells the original PR once everything except held PRs is on trunk.
-func (c *Runner) reportLanded(sp *stackPRs, last forge.PR, m stack.Marker) error {
-	if m.Source == 0 {
-		return nil
-	}
-	var landed, held []string
-	for _, p := range sp.prs {
-		pm := sp.marks[p.Number]
-		switch {
-		case pm.Hold:
-			held = append(held, fmt.Sprintf("#%d", p.Number))
-		case p.Merged() || p.State == "CLOSED" && m.Atomic():
-			landed = append(landed, fmt.Sprintf("#%d", p.Number))
-		default:
-			return nil
-		}
-	}
-	if len(landed)+len(held) < m.Total {
-		return nil // PRs missing from the listing
-	}
-	var b strings.Builder
-	how := "one PR at a time"
-	if m.Atomic() {
-		how = fmt.Sprintf("atomically via #%d", last.Number)
-	}
-	fmt.Fprintf(&b, "✅ Stack `%s` has landed on `%s` %s: %s.", m.Stack, m.Trunk, how, strings.Join(landed, ", "))
-	if len(held) > 0 {
-		fmt.Fprintf(&b, "\n\n🔒 The activation PR %s is ready and waiting for a human to merge it.", strings.Join(held, ", "))
-	}
-	c.logf("✅ stack %s landed; noted on #%d", m.Stack, m.Source)
-	return c.Forge.Comment(m.Source, b.String())
-}
-
-func (c *Runner) refreshNav(sp *stackPRs, skip map[int]bool) error {
-	nav := sp.nav()
-	for _, p := range sp.prs {
-		if !p.Open() || skip[p.Number] {
-			continue
-		}
-		body := stack.MergeBody(p.Body, stack.RenderBlock(sp.marks[p.Number], nav))
-		if body != p.Body {
-			if err := c.Forge.EditPR(p.Number, nil, &body); err != nil {
-				return err
-			}
-		}
-	}
+// pause stops a stack at target with a reason, until someone lands it again.
+func (c *Runner) pause(target forge.PR, m stack.Marker, why string) error {
+	c.Forge.Comment(target.Number, fmt.Sprintf("⏸️ Stack `%s` is paused here; nothing from it reached `%s`. %s\n\n"+
+		"Fix it, then run `stackq land --pr %d` (or the stackq workflow with command `land`).", m.Stack, m.Trunk, why, target.Number))
+	c.Forge.AddLabels(target.Number, LabelBlocked)
+	c.setStatus(target, fmt.Sprintf("⏸ **Paused.** %s Fix it, then run `stackq land --pr %d`.", why, target.Number))
+	c.logf("⏸ #%d: %s; stack %s paused", target.Number, why, m.Stack)
 	return nil
 }
 
@@ -943,15 +689,142 @@ func (c *Runner) Dequeued(n int) error {
 	if !ok {
 		return nil
 	}
-	what := "the PRs above it will not be queued until it lands"
-	if m.Atomic() {
-		what = "nothing from the stack reached trunk"
+	return c.pause(pr, m, "It left the merge queue without merging (a failed check, or a conflict with trunk).")
+}
+
+// FinishLanded finishes every stack stackq landed whose merge has happened:
+// it clears the landing labels and status, reports the landing on the top
+// part and the original PR, and announces the activation PR, which GitHub has
+// retargeted onto trunk. A merge made by the merge queue for the built-in
+// GITHUB_TOKEN starts no "PR merged" workflow, so this runs on every tick;
+// once a stack is finished it does nothing.
+func (c *Runner) FinishLanded() error {
+	all, err := c.Forge.ListPRs("all")
+	if err != nil {
+		return err
 	}
-	c.Forge.Comment(n, fmt.Sprintf("⏸️ This PR left the merge queue without merging, so stack `%s` is paused here; %s.\n\n"+
-		"Fix the failure, push, then run `stackq land --pr %d` (or the stackq workflow with command `land`).", m.Stack, what, n))
-	c.Forge.AddLabels(n, LabelBlocked)
-	c.setStatus(pr, fmt.Sprintf("⏸ **Paused.** This PR left the merge queue without merging; %s. "+
-		"Fix the failure, push, then run `stackq land --pr %d`.", what, n))
-	c.logf("⏸ #%d left the queue; stack %s paused", n, m.Stack)
+	var names []string
+	seen := map[string]bool{}
+	for _, p := range all {
+		m, ok := c.markerOf(p)
+		if !ok || seen[m.Stack] {
+			continue
+		}
+		// A stack still to finish has a merged PR whose status says landing.
+		if _, asked := requestOf(p.Body); asked && p.Merged() {
+			seen[m.Stack] = true
+			names = append(names, m.Stack)
+		}
+	}
+	sort.Strings(names)
+	var errs []error
+	for _, name := range names {
+		if err := c.finish(name); err != nil {
+			errs = append(errs, fmt.Errorf("stack %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// AfterMerge reacts to a merged stack PR: it finishes what landed (and, for
+// an incremental stack, lands the next part).
+func (c *Runner) AfterMerge(n int) error {
+	pr, err := c.Forge.GetPR(n)
+	if err != nil {
+		return err
+	}
+	if !pr.Merged() {
+		c.logf("#%d is not merged; nothing to do", n)
+		return nil
+	}
+	m, ok := c.markerOf(pr)
+	if !ok {
+		c.logf("#%d is not part of a stackq stack; nothing to do", n)
+		return nil
+	}
+	return c.finish(m.Stack)
+}
+
+// finish tidies one stack after GitHub merged some or all of it. For an
+// incremental stack it then lands the next part when Enqueue is set: a merge
+// the queue made for the built-in token starts no "PR merged" run, so this has
+// to happen wherever a merge is first noticed, on a tick as well.
+func (c *Runner) finish(name string) error {
+	sp, err := c.loadStack(name)
+	if err != nil {
+		return err
+	}
+	var landedNow []forge.PR
+	for _, p := range sp.prs {
+		if !p.Merged() {
+			continue
+		}
+		if _, asked := requestOf(p.Body); asked {
+			landedNow = append(landedNow, p)
+		}
+		c.Forge.RemoveLabels(p.Number, LabelLanding, LabelBlocked)
+	}
+	for _, p := range landedNow {
+		m := sp.marks[p.Number]
+		msg := fmt.Sprintf("✅ **Landed** on `%s`. Roll back with `stackq revert --pr %d`.", m.Trunk, p.Number)
+		if d, err := c.Forge.Details(p.Number); err == nil && d.MergeCommit != "" {
+			msg += fmt.Sprintf(" Trunk commit: `%s`.", git.Short(d.MergeCommit))
+		}
+		c.setStatus(p, msg)
+		c.logf("✅ #%d landed (stack %s)", p.Number, name)
+	}
+	if err := c.refreshNav(sp); err != nil {
+		return err
+	}
+	if len(landedNow) == 0 {
+		return nil
+	}
+	if !sp.landed() {
+		if m := sp.marks[landedNow[0].Number]; c.Enqueue && !m.Atomic() {
+			return c.attempt(m, true, 0)
+		}
+		return nil
+	}
+	top, _ := sp.lander()
+	m := sp.marks[top.Number]
+	var held []string
+	for _, p := range sp.prs {
+		if pm := sp.marks[p.Number]; pm.Hold && p.Open() {
+			held = append(held, fmt.Sprintf("#%d", p.Number))
+			c.Forge.AddLabels(p.Number, LabelActivation)
+			c.Forge.Comment(p.Number, fmt.Sprintf("🔒 The rest of stack `%s` is on `%s`, and GitHub moves this activation PR onto `%s`; "+
+				"stackq will not merge it. Merge it (or run `stackq land --pr %d`) when you are ready to switch the feature on.",
+				m.Stack, m.Trunk, m.Trunk, p.Number))
+			c.logf("🔒 #%d (activation) is ready and left for a human", p.Number)
+		}
+	}
+	var landed []string
+	for _, p := range sp.parts() {
+		landed = append(landed, fmt.Sprintf("#%d", p.Number))
+	}
+	if m.Source != 0 {
+		msg := fmt.Sprintf("✅ Stack `%s` has landed on `%s`: %s.", m.Stack, m.Trunk, strings.Join(landed, ", "))
+		if len(held) > 0 {
+			msg += fmt.Sprintf("\n\n🔒 The activation PR %s is ready and waiting for a human to merge it.", strings.Join(held, ", "))
+		}
+		c.Forge.Comment(m.Source, msg)
+		c.logf("✅ stack %s landed; noted on #%d", m.Stack, m.Source)
+	}
+	return nil
+}
+
+func (c *Runner) refreshNav(sp *stackPRs) error {
+	nav := sp.nav()
+	for _, p := range sp.prs {
+		if !p.Open() {
+			continue
+		}
+		body := stack.MergeBody(p.Body, stack.RenderBlock(sp.marks[p.Number], nav))
+		if body != p.Body {
+			if err := c.Forge.EditPR(p.Number, nil, &body); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }

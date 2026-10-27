@@ -49,10 +49,10 @@ Local workflow:
   stackq plan  [--from BRANCH] [--max-lines N]       preview the split
                [--markdown FILE]                     also write it as a PR comment body
   stackq split [--from BRANCH] [--check CMD]         create the stack branches
-  stackq push  [--draft] [--close-source]            push branches, open/retarget PRs,
-                                                     link (and optionally close) the original PR
-  stackq land  [--pr N]                              atomic: gate every part, queue the whole stack once
-                                                     incremental: queue the bottom PR
+  stackq push  [--draft] [--close-source]            push branches, open the PRs, link them as a GitHub
+                                                     stack, link (and optionally close) the original PR
+  stackq land  [--pr N]                              atomic: gate every part, then GitHub merges the stack
+                                                     incremental: the lowest open part (or N and those below)
   stackq sync  [--no-fetch] [--trunk]                restack after edits or merges
   stackq revert --pr N [--only] [--enqueue]          open one PR that reverts a landed stack
   stackq queue --pr N                                add any PR to the priority pool, then schedule
@@ -747,7 +747,7 @@ func cmdCI(args []string) error {
 	var c common
 	c.register(fs)
 	prN := fs.Int("pr", 0, "pull request number")
-	noEnqueue := fs.Bool("no-enqueue", false, "restack but don't queue the next PR")
+	noEnqueue := fs.Bool("no-enqueue", false, "incremental stacks: finish a merge but don't land the next part")
 	revertEnqueue := fs.Bool("revert-enqueue", false, "revert: queue the revert PR")
 	if err := parse(fs, args); err != nil {
 		return err

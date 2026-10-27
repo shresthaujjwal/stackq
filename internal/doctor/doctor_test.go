@@ -27,7 +27,8 @@ func (f fakeAPI) Queue(string) ([]forge.QueueEntry, error) { return nil, f.queue
 
 func healthy() fakeAPI {
 	return fakeAPI{paths: map[string]string{
-		"repos/{owner}/{repo}":                              `{"default_branch":"main","allow_auto_merge":true,"allow_rebase_merge":true,"delete_branch_on_merge":true}`,
+		"repos/{owner}/{repo}":                              `{"default_branch":"main","allow_rebase_merge":true,"delete_branch_on_merge":true}`,
+		"repos/{owner}/{repo}/stacks?per_page=1":            `[]`,
 		"repos/{owner}/{repo}/rules/branches/main":          `[{"type":"merge_queue","parameters":{"merge_method":"REBASE"}}]`,
 		"repos/{owner}/{repo}/actions/permissions/workflow": `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":true}`,
 		"repos/{owner}/{repo}/labels?per_page=100":          `[{"name":"bug"},{"name":"stackq:split"},{"name":"stackq:plan"}]`,
@@ -186,5 +187,14 @@ func TestConfigProblems(t *testing.T) {
 	got := strings.Join(levels(checkConfig(bad), Fail), "\n")
 	if !strings.Contains(got, "has no {name}") || !strings.Contains(got, "is not atomic or incremental") {
 		t.Fatalf("config problems not reported: %q", got)
+	}
+}
+
+func TestARepoWithoutGitHubStacksFails(t *testing.T) {
+	api := healthy()
+	delete(api.paths, "repos/{owner}/{repo}/stacks?per_page=1")
+	rs := Run(api, repoWith(t, healthyFiles()), cfg)
+	if got := strings.Join(levels(rs, Fail), "\n"); !strings.Contains(got, "stacked pull requests are not available") {
+		t.Fatalf("missing GitHub stacks must fail the check, got fails: %q", got)
 	}
 }
