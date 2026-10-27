@@ -134,7 +134,6 @@ func checkRepo(api API, cfg Config) []Result {
 	}
 	var repo struct {
 		DefaultBranch    string `json:"default_branch"`
-		AllowAutoMerge   bool   `json:"allow_auto_merge"`
 		AllowRebaseMerge bool   `json:"allow_rebase_merge"`
 		DeleteOnMerge    bool   `json:"delete_branch_on_merge"`
 	}
@@ -146,13 +145,14 @@ func checkRepo(api API, cfg Config) []Result {
 		rs = append(rs, warn(fmt.Sprintf("trunk is %s, but the default branch is %s", cfg.Trunk, repo.DefaultBranch),
 			`stackq.yml checks out the default branch; set "trunk" in .stackq.json to match`))
 	}
-	if repo.AllowAutoMerge {
-		rs = append(rs, ok("auto-merge allowed (the fallback when a PR cannot join the queue directly)"))
+	if _, err := api.API("repos/{owner}/{repo}/stacks?per_page=1"); err != nil {
+		rs = append(rs, fail("GitHub stacked pull requests are not available ("+short(err)+")",
+			"stackq links every stack as a GitHub stack and lands it with GitHub's merge of the stack; this needs github.com with stacked pull requests (public preview since 2026-07)"))
 	} else {
-		rs = append(rs, warn("auto-merge is not allowed", "Settings > General > Allow auto-merge; without it the enqueue fallback fails"))
+		rs = append(rs, ok("GitHub stacked pull requests are available"))
 	}
 	if !repo.AllowRebaseMerge {
-		rs = append(rs, warn("rebase merging is off", "atomic stacks land one commit per part only with the rebase method"))
+		rs = append(rs, warn("rebase merging is off", "with the rebase method each part lands as its own commits, so git bisect and revert work per part"))
 	}
 	if !repo.DeleteOnMerge {
 		rs = append(rs, warn("head branches are not deleted after merge", "Settings > General > Automatically delete head branches, or run stackq gc"))

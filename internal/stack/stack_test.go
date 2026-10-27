@@ -155,6 +155,10 @@ func TestPushThenSyncAfterRebaseMerge(t *testing.T) {
 	if err := stack.Push(r, f, s, stack.PushOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	st, _ := f.StackOf(s.Branches[0].PR)
+	if prs, _ := f.StackPRs(st); st == 0 || len(prs) != len(s.Branches) {
+		t.Fatalf("push should link all %d PRs as one GitHub stack, got stack %d with %v", len(s.Branches), st, prs)
+	}
 	for i, b := range s.Branches {
 		pr, _ := f.GetPR(b.PR)
 		m, ok := stack.ParseMarker(pr.Body)
@@ -168,6 +172,7 @@ func TestPushThenSyncAfterRebaseMerge(t *testing.T) {
 	testrepo.Commit(t, other, "unrelated", map[string]string{"NOTES.txt": "hi\n"})
 	testrepo.Must(t, other, "push", "-q", "origin", "main")
 	testrepo.RebaseMerge(t, bare, "origin/main~1", s.Branches[0].Name, true)
+	f.MarkMerged(s.Branches[0].PR) // GitHub records it and retargets PR 2 onto main
 
 	if err := stack.Sync(r, s, stack.SyncOptions{Fetch: true}); err != nil {
 		t.Fatal(err)
@@ -524,5 +529,34 @@ func TestSyncFallsBackToGitWhenTheForgeFails(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "going by git alone") {
 		t.Fatalf("the failure should be noted:\n%s", log.String())
+	}
+}
+
+func TestPushAddsNewPartsOnTopOfTheGitHubStack(t *testing.T) {
+	r, _, s, f := pushed(t, "")
+	st, _ := f.StackOf(s.Branches[0].PR)
+	// Someone unstacked the top PR on GitHub; the next push puts it back on top.
+	f.Stacks[st] = f.Stacks[st][:len(f.Stacks[st])-1]
+	var log bytes.Buffer
+	if err := stack.Push(r, f, s, stack.PushOptions{Log: &log}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Stacks[st]; len(got) != len(s.Branches) || got[len(got)-1] != s.Branches[len(s.Branches)-1].PR {
+		t.Fatalf("top PR not added back: %v\n%s", got, log.String())
+	}
+	if !strings.Contains(log.String(), "added #") {
+		t.Fatalf("log should say so:\n%s", log.String())
+	}
+}
+
+func TestPushLeavesTheBaseOfAStackedPRToGitHub(t *testing.T) {
+	r, _, s, f := pushed(t, "")
+	s.Branches[1].Parent = "main" // what a local sync might think
+	var log bytes.Buffer
+	if err := stack.Push(r, f, s, stack.PushOptions{Log: &log}); err != nil {
+		t.Fatalf("push must not try to retarget a stacked PR: %v", err)
+	}
+	if !strings.Contains(log.String(), "sets its base") {
+		t.Fatalf("log should explain:\n%s", log.String())
 	}
 }

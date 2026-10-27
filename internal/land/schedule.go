@@ -19,17 +19,21 @@ func (c *Runner) now() time.Time {
 
 func (c *Runner) prioOn() bool { return c.Prio != nil && c.Prio.Enabled }
 
-// submit hands a PR to the merge queue: straight in when prioritization is
-// off, otherwise into the pool followed by a scheduling pass.
-func (c *Runner) submit(pr forge.PR, trunk string) (queued bool, err error) {
+// submit asks GitHub to merge pr (and, in a GitHub stack, the open PRs below
+// it: parts in all): straight away when prioritization is off, otherwise
+// through the pool and a scheduling pass.
+func (c *Runner) submit(pr forge.PR, trunk string, parts int) (queued bool, err error) {
 	if !c.prioOn() {
-		if err := c.Forge.Enqueue(pr, forge.EnqueueOptions{}); err != nil {
+		if err := c.merge(pr, parts); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
 	if err := c.Forge.AddLabels(pr.Number, c.Prio.Label); err != nil {
 		return false, err
+	}
+	if _, ok := c.markerOf(pr); ok {
+		c.setStatus(pr, statusPool(parts))
 	}
 	c.logf("⧗ #%d is waiting in the priority pool", pr.Number)
 	decisions, err := c.Schedule(trunk, false)
@@ -108,12 +112,18 @@ func (c *Runner) Schedule(trunk string, dryRun bool) ([]prio.Decision, error) {
 		}
 		pr := byNum[d.PR.Number]
 		jump := d.Action == prio.Jump
-		err := c.Forge.Enqueue(pr, forge.EnqueueOptions{Jump: jump})
-		if err != nil && jump && !forge.IsPermanent(err) {
-			c.logf("! #%d could not jump (%v); queueing it normally", pr.Number, err)
-			jump = false
-			d.Note = "jump refused by GitHub; first in line instead"
-			err = c.Forge.Enqueue(pr, forge.EnqueueOptions{})
+		var err error
+		if jump {
+			// Only a PR outside a GitHub stack can jump; a stack is merged
+			// with the asynchronous merge API, which joins the back.
+			if err = c.Forge.Jump(pr); err != nil && !forge.IsPermanent(err) {
+				c.logf("! #%d could not jump (%v); queueing it normally", pr.Number, err)
+				jump = false
+				d.Note = "jump refused by GitHub; first in line instead"
+				err = c.merge(pr, c.mergeCount(pr, stacks))
+			}
+		} else {
+			err = c.merge(pr, c.mergeCount(pr, stacks))
 		}
 		if err != nil {
 			d.Action, d.Note = prio.Skip, "enqueue failed: "+err.Error()
@@ -141,25 +151,56 @@ func (c *Runner) Schedule(trunk string, dryRun bool) ([]prio.Decision, error) {
 	return decisions, nil
 }
 
+func (c *Runner) stackFor(name string, stacks map[string]*stackPRs) (*stackPRs, error) {
+	if sp := stacks[name]; sp != nil {
+		return sp, nil
+	}
+	sp, err := c.loadStack(name)
+	if err != nil {
+		return nil, err
+	}
+	stacks[name] = sp
+	return sp, nil
+}
+
+// mergeCount is how many PRs merging pr lands: it and, in a stack, the open
+// parts below it.
+func (c *Runner) mergeCount(pr forge.PR, stacks map[string]*stackPRs) int {
+	m, ok := c.markerOf(pr)
+	if !ok {
+		return 1
+	}
+	sp, err := c.stackFor(m.Stack, stacks)
+	if err != nil {
+		return 1
+	}
+	n := 0
+	for _, p := range sp.prs {
+		if p.Open() && sp.marks[p.Number].Index <= m.Index {
+			n++
+		}
+	}
+	return max(n, 1)
+}
+
 // eligible decides whether a pool PR may be queued now.
 func (c *Runner) eligible(p forge.PR, trunk string, stacks map[string]*stackPRs) (bool, string) {
-	if p.BaseRef != trunk {
-		return false, "targets " + p.BaseRef + ", not " + trunk
+	m, isStack := c.markerOf(p)
+	// In a GitHub stack a part targets the part below it; what lands on
+	// trunk is the whole stack, so the stack's trunk is what counts.
+	if base := p.BaseRef; base != trunk && !(isStack && m.Trunk == trunk) {
+		return false, "targets " + base + ", not " + trunk
 	}
 	if p.Draft {
 		return false, "draft"
 	}
-	if m, ok := c.markerOf(p); ok && m.Atomic() && !m.Hold {
-		sp := stacks[m.Stack]
-		if sp == nil {
-			var err error
-			if sp, err = c.loadStack(m.Stack); err != nil {
-				return false, err.Error()
-			}
-			stacks[m.Stack] = sp
+	if isStack && !m.Hold {
+		sp, err := c.stackFor(m.Stack, stacks)
+		if err != nil {
+			return false, err.Error()
 		}
-		if l, ok := sp.lander(); ok && l.Number != p.Number {
-			return false, fmt.Sprintf("part of atomic stack %s; it lands inside #%d", m.Stack, l.Number)
+		if l, ok := sp.lander(); ok && m.Atomic() && l.Number != p.Number {
+			return false, fmt.Sprintf("part of atomic stack %s; it lands with #%d", m.Stack, l.Number)
 		}
 	}
 	d, err := c.Forge.Details(p.Number)

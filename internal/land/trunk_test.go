@@ -15,8 +15,8 @@ func TestMarkersNamingAnotherTrunkAreIgnoredWhenTheTrunkIsKnown(t *testing.T) {
 
 	var log bytes.Buffer
 	good := &land.Runner{Repo: fx.dev, Forge: fx.f, Remote: "origin", Trunk: "main", Log: &log}
-	if err := good.AutoLand(); err != nil || len(fx.f.Enqueued) != 1 {
-		t.Fatalf("markers that name the repository's trunk must work as before: %v %v\n%s", err, fx.f.Enqueued, log.String())
+	if err := good.AutoLand(); err != nil || len(fx.f.Merges) != 1 {
+		t.Fatalf("markers that name the repository's trunk must work as before: %v %v\n%s", err, fx.f.Merges, log.String())
 	}
 
 	// A second stack whose bodies were rewritten, as a PR author could do.
@@ -31,8 +31,8 @@ func TestMarkersNamingAnotherTrunkAreIgnoredWhenTheTrunkIsKnown(t *testing.T) {
 	}
 	log.Reset()
 	bad := &land.Runner{Repo: fx2.dev, Forge: fx2.f, Remote: "origin", Trunk: "main", Log: &log}
-	if err := bad.AutoLand(); err != nil || len(fx2.f.Enqueued) != 0 {
-		t.Fatalf("a marker naming another trunk must not be acted on: %v %v", err, fx2.f.Enqueued)
+	if err := bad.AutoLand(); err != nil || len(fx2.f.Merges) != 0 {
+		t.Fatalf("a marker naming another trunk must not be acted on: %v %v", err, fx2.f.Merges)
 	}
 	if !strings.Contains(log.String(), `names trunk "evil"`) || !strings.Contains(log.String(), `trunk is "main"`) {
 		t.Fatalf("the rejection should be logged:\n%s", log.String())

@@ -48,19 +48,12 @@ type QueueEntry struct {
 	Jumped   bool   // labelled stackq:jumped
 }
 
-type EnqueueOptions struct {
-	// Jump puts the PR at the front of the queue. GitHub rebuilds every
-	// in-flight entry when this happens.
-	Jump bool
-}
-
 // Details is the review, check and merge state of a PR, fetched on demand.
 type Details struct {
 	Approvals        []string // logins whose latest review approves
 	ChangesRequested []string // logins whose latest review requests changes
 	Checks           string   // success, pending, failure or none
 	MergeCommit      string   // the commit GitHub recorded on the base branch
-	AutoMerge        bool     // auto-merge is on and waiting for the PR's requirements
 	Commits          int      // commits in the PR
 }
 
@@ -78,9 +71,25 @@ type Forge interface {
 	CreatePR(head, base, title, body string, draft bool) (PR, error)
 	// EditPR changes the base and/or body; nil leaves a field alone.
 	EditPR(n int, base, body *string) error
-	// Enqueue adds the PR to the merge queue, or arranges for it to join the
-	// queue as soon as its required checks pass.
-	Enqueue(pr PR, o EnqueueOptions) error
+	// Merge asks GitHub to merge PR n with the asynchronous merge API, through
+	// the merge queue when the base branch has one. For a PR in a GitHub stack
+	// that includes every open PR below it, as one all-or-nothing request.
+	// headSHA, if set, must still be the PR's head when the merge runs.
+	Merge(n int, headSHA string) (MergeRequest, error)
+	// MergeResult reads the progress of a request Merge made.
+	MergeResult(n int, uuid string) (MergeRequest, error)
+	// Jump puts a PR that is not in a GitHub stack at the front of the merge
+	// queue. GitHub stacks cannot jump.
+	Jump(pr PR) error
+	// StackOf returns the number of the GitHub stack PR n is in, or 0.
+	StackOf(n int) (int, error)
+	// StackPRs returns the PR numbers of GitHub stack s, bottom first.
+	StackPRs(s int) ([]int, error)
+	// CreateStack links PRs, bottom first, into a GitHub stack. Each PR's base
+	// must be the head branch of the PR before it.
+	CreateStack(prs []int) (int, error)
+	// AddToStack puts PRs, bottom first, on top of GitHub stack s.
+	AddToStack(s int, prs []int) error
 	// ListPool returns open PRs carrying label, with size, author and labels.
 	ListPool(label string) ([]PR, error)
 	// Queue returns GitHub's merge queue for branch, front first.
@@ -90,19 +99,31 @@ type Forge interface {
 	Comment(n int, body string) error
 	ClosePR(n int) error
 	AddLabels(n int, labels ...string) error
-	// RequestReviews asks the given users to review PR n. It returns the
-	// users GitHub refused (for example the PR's author), with the reason.
-	RequestReviews(n int, users []string) (refused map[string]error)
 	RemoveLabels(n int, labels ...string) error
 }
+
+// MergeRequest is the state of an asynchronous merge request.
+type MergeRequest struct {
+	UUID    string // empty once GitHub stops tracking it (merged, enqueued)
+	Status  string // pending, enqueued, merged or failed
+	Message string // GitHub's explanation, for failed in particular
+}
+
+// Merge statuses, as the asynchronous merge API reports them. Enqueued is
+// final: it means the PR joined the merge queue, not that it merged.
+const (
+	MergePending  = "pending"
+	MergeEnqueued = "enqueued"
+	MergeMerged   = "merged"
+	MergeFailed   = "failed"
+)
 
 // GH implements Forge with the gh CLI, which is preinstalled on GitHub
 // runners and reads GH_TOKEN / GH_REPO from the environment.
 type GH struct {
 	Dir  string
 	Repo string // optional owner/name; otherwise gh infers it from the git remote
-	// Log receives notes about fallbacks, such as the error that made
-	// Enqueue use auto-merge. Nil means os.Stderr.
+	// Log receives notes for the person running stackq. Nil means os.Stderr.
 	Log io.Writer
 }
 
@@ -212,9 +233,8 @@ type ghDetails struct {
 	MergeCommit *struct {
 		Oid string `json:"oid"`
 	} `json:"mergeCommit"`
-	Commits          []json.RawMessage `json:"commits"`
-	HeadRefOid       string            `json:"headRefOid"`
-	AutoMergeRequest *struct{}         `json:"autoMergeRequest"`
+	Commits    []json.RawMessage `json:"commits"`
+	HeadRefOid string            `json:"headRefOid"`
 }
 
 // commitChecks lists the check runs and commit statuses on a commit. The PR's
@@ -262,7 +282,7 @@ func (g *GH) commitChecks(sha string) ([]string, error) {
 }
 
 func (g *GH) Details(n int) (Details, error) {
-	out, err := g.run("", "pr", "view", strconv.Itoa(n), "--json", "latestReviews,statusCheckRollup,mergeCommit,commits,headRefOid,autoMergeRequest")
+	out, err := g.run("", "pr", "view", strconv.Itoa(n), "--json", "latestReviews,statusCheckRollup,mergeCommit,commits,headRefOid")
 	if err != nil {
 		return Details{}, err
 	}
@@ -302,7 +322,6 @@ func (g *GH) Details(n int) (Details, error) {
 		d.MergeCommit = raw.MergeCommit.Oid
 	}
 	d.Commits = len(raw.Commits)
-	d.AutoMerge = raw.AutoMergeRequest != nil
 	return d, nil
 }
 
@@ -387,13 +406,8 @@ const enqueueMutation = `mutation($id: ID!, $oid: GitObjectID, $jump: Boolean) {
   enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid, jump: $jump}) { mergeQueueEntry { position } }
 }`
 
-const autoMergeMutation = `mutation($id: ID!) {
-  enablePullRequestAutoMerge(input: {pullRequestId: $id}) { pullRequest { number } }
-}`
-
-// EnqueueError is a refusal whose cause GitHub's message names and that
-// auto-merge would hit too, so retrying with auto-merge only adds noise (and,
-// for a stale head, would skip the head check).
+// EnqueueError is a refusal whose cause GitHub's message names, so retrying
+// the same request cannot work.
 type EnqueueError struct {
 	PR     int
 	Kind   string // closed, draft, stale, missing or forbidden
@@ -416,15 +430,14 @@ func (e *EnqueueError) Error() string {
 }
 
 // IsPermanent reports whether err is an EnqueueError: retrying the same
-// request, or enabling auto-merge instead, cannot work.
+// request cannot work.
 func IsPermanent(err error) bool {
 	var e *EnqueueError
 	return errors.As(err, &e)
 }
 
 // classifyEnqueue maps GitHub's wording (seen on real runs, 2026-10-26) to an
-// EnqueueError, or nil when the message is not one we know to be final. Any
-// other message, such as pending checks, falls back to auto-merge.
+// EnqueueError, or nil when the message is not one we know to be final.
 func classifyEnqueue(pr int, msg string) *EnqueueError {
 	m := strings.ToLower(msg)
 	kind := ""
@@ -445,13 +458,9 @@ func classifyEnqueue(pr int, msg string) *EnqueueError {
 	return &EnqueueError{PR: pr, Kind: kind, Detail: strings.TrimSpace(msg)}
 }
 
-// Enqueue tries to add the PR to the merge queue directly. If GitHub refuses
-// for a reason that auto-merge would share (the PR is closed, a draft, moved
-// on, missing, or the token may not queue it), it returns an EnqueueError.
-// For anything else (usually because required checks on the freshly pushed
-// head are still running), it enables auto-merge instead, which on a
-// merge-queue branch means "join the queue when ready".
-func (g *GH) Enqueue(pr PR, o EnqueueOptions) error {
+// Jump puts a standalone PR at the front of the merge queue with the
+// enqueuePullRequest mutation (the asynchronous merge API has no jump).
+func (g *GH) Jump(pr PR) error {
 	if pr.NodeID == "" {
 		full, err := g.GetPR(pr.Number)
 		if err != nil {
@@ -459,31 +468,165 @@ func (g *GH) Enqueue(pr PR, o EnqueueOptions) error {
 		}
 		pr.NodeID = full.NodeID
 	}
-	args := []string{"api", "graphql", "-f", "query=" + enqueueMutation, "-f", "id=" + pr.NodeID}
+	args := []string{"api", "graphql", "-f", "query=" + enqueueMutation, "-f", "id=" + pr.NodeID, "-F", "jump=true"}
 	if pr.HeadSHA != "" {
 		args = append(args, "-f", "oid="+pr.HeadSHA)
 	}
-	args = append(args, "-F", "jump="+strconv.FormatBool(o.Jump))
-	_, errQ := g.run("", args...)
-	if errQ == nil {
-		return nil
+	if _, err := g.run("", args...); err != nil {
+		if ce := classifyEnqueue(pr.Number, err.Error()); ce != nil {
+			return ce
+		}
+		return fmt.Errorf("could not jump #%d to the front of the queue: %v", pr.Number, err)
 	}
-	if ce := classifyEnqueue(pr.Number, errQ.Error()); ce != nil {
-		return ce
+	return nil
+}
+
+// apiVersion is the REST API version that has GitHub stacks and the
+// asynchronous merge API.
+const apiVersion = "X-GitHub-Api-Version: 2026-03-10"
+
+// rest runs a REST call with apiVersion and returns the response body even
+// when GitHub answers with an error status, since the asynchronous merge API
+// puts its answer (the pending request, the failure) in the body of a 4xx too.
+func (g *GH) rest(method, path string, body any) ([]byte, error) {
+	args := []string{"api", "-X", method, "-H", apiVersion, path}
+	stdin := ""
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		stdin = string(b)
+		args = append(args, "--input", "-")
 	}
-	if o.Jump {
-		// Auto-merge can't jump; let the caller decide.
-		return fmt.Errorf("could not jump #%d to the front of the queue: %v", pr.Number, errQ)
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = g.Dir
+	cmd.Env = os.Environ()
+	if g.Repo != "" {
+		cmd.Env = append(cmd.Env, "GH_REPO="+g.Repo)
 	}
-	_, errA := g.run("", "api", "graphql", "-f", "query="+autoMergeMutation, "-f", "id="+pr.NodeID)
-	if errA == nil {
-		// Auto-merge is not the queue: GitHub adds the PR once its own rules
-		// are met, so say why the direct enqueue was not used.
-		g.logf("! could not enqueue #%d directly (%v); enabled auto-merge instead, GitHub queues it once its requirements are met",
-			pr.Number, strings.TrimSpace(errQ.Error()))
-		return nil
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
 	}
-	return fmt.Errorf("could not enqueue #%d: %v; auto-merge fallback also failed: %v", pr.Number, errQ, errA)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return out.Bytes(), fmt.Errorf("gh api %s %s: %s", method, path, strings.TrimSpace(errb.String()+" "+err.Error()))
+	}
+	return out.Bytes(), nil
+}
+
+// mergeAnswer is the body of every asynchronous merge response.
+type mergeAnswer struct {
+	Status  string `json:"status"`
+	Details struct {
+		Message string `json:"message"`
+		UUID    string `json:"uuid"`
+	} `json:"details"`
+}
+
+func (a mergeAnswer) request() MergeRequest {
+	return MergeRequest{UUID: a.Details.UUID, Status: a.Status, Message: a.Details.Message}
+}
+
+// Merge uses PUT .../merge-async with merge_action "default": the merge queue
+// when the base branch has one, a direct merge otherwise. GitHub answers 202
+// (accepted, pending), 200 (already merged or queued), 409 (a request is
+// already pending: its uuid is returned) or 400 (not mergeable, e.g. a draft).
+// All four carry the status in the body, so they all return a MergeRequest.
+func (g *GH) Merge(n int, headSHA string) (MergeRequest, error) {
+	body := map[string]string{"merge_action": "default"}
+	if headSHA != "" {
+		body["sha"] = headSHA
+	}
+	out, err := g.rest("PUT", fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/merge-async", n), body)
+	var a mergeAnswer
+	if jerr := json.Unmarshal(out, &a); jerr == nil && a.Status != "" {
+		return a.request(), nil
+	}
+	if err != nil {
+		return MergeRequest{}, err
+	}
+	return MergeRequest{}, fmt.Errorf("merge #%d: unexpected answer %q", n, strings.TrimSpace(string(out)))
+}
+
+func (g *GH) MergeResult(n int, uuid string) (MergeRequest, error) {
+	out, err := g.rest("GET", fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/merge-async/%s", n, uuid), nil)
+	if err != nil {
+		return MergeRequest{}, err
+	}
+	var a mergeAnswer
+	if err := json.Unmarshal(out, &a); err != nil {
+		return MergeRequest{}, err
+	}
+	r := a.request()
+	if r.UUID == "" {
+		r.UUID = uuid
+	}
+	return r, nil
+}
+
+func (g *GH) StackOf(n int) (int, error) {
+	out, err := g.rest("GET", fmt.Sprintf("repos/{owner}/{repo}/pulls/%d", n), nil)
+	if err != nil {
+		return 0, err
+	}
+	var pr struct {
+		Stack *struct {
+			Number int `json:"number"`
+		} `json:"stack"`
+	}
+	if err := json.Unmarshal(out, &pr); err != nil {
+		return 0, err
+	}
+	if pr.Stack == nil {
+		return 0, nil
+	}
+	return pr.Stack.Number, nil
+}
+
+type ghStack struct {
+	Number       int `json:"number"`
+	PullRequests []struct {
+		Number int `json:"number"`
+	} `json:"pull_requests"`
+}
+
+func (s ghStack) prs() []int {
+	var out []int
+	for _, p := range s.PullRequests {
+		out = append(out, p.Number)
+	}
+	return out
+}
+
+func (g *GH) StackPRs(stack int) ([]int, error) {
+	out, err := g.rest("GET", fmt.Sprintf("repos/{owner}/{repo}/stacks/%d", stack), nil)
+	if err != nil {
+		return nil, err
+	}
+	var st ghStack
+	if err := json.Unmarshal(out, &st); err != nil {
+		return nil, err
+	}
+	return st.prs(), nil
+}
+
+func (g *GH) CreateStack(prs []int) (int, error) {
+	out, err := g.rest("POST", "repos/{owner}/{repo}/stacks", map[string][]int{"pull_requests": prs})
+	if err != nil {
+		return 0, err
+	}
+	var st ghStack
+	if err := json.Unmarshal(out, &st); err != nil {
+		return 0, err
+	}
+	return st.Number, nil
+}
+
+func (g *GH) AddToStack(stack int, prs []int) error {
+	_, err := g.rest("POST", fmt.Sprintf("repos/{owner}/{repo}/stacks/%d/add", stack), map[string][]int{"pull_requests": prs})
+	return err
 }
 
 // API makes one REST GET through gh; path may use the {owner}/{repo}
@@ -653,18 +796,6 @@ func (g *GH) AddLabels(n int, labels ...string) error {
 		}
 	}
 	return nil
-}
-
-func (g *GH) RequestReviews(n int, users []string) map[string]error {
-	refused := map[string]error{}
-	for _, u := range users {
-		// One call per user, so a refusal (the author cannot review their own
-		// PR) does not stop the others being asked.
-		if _, err := g.run("", "api", "-X", "POST", fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/requested_reviewers", n), "-f", "reviewers[]="+u); err != nil {
-			refused[u] = err
-		}
-	}
-	return refused
 }
 
 func (g *GH) RemoveLabels(n int, labels ...string) error {

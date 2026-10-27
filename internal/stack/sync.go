@@ -141,9 +141,10 @@ type PushOptions struct {
 	Log         io.Writer
 }
 
-// Push publishes every unmerged branch with a lease, opens or retargets
-// their PRs, refreshes the stack overview in each PR body, and links the
-// stack to the original PR.
+// Push publishes every unmerged branch with a lease, opens their PRs (or
+// retargets ones outside a GitHub stack), links them as a GitHub stack,
+// refreshes the stack overview in each PR body, and links the stack to the
+// original PR.
 func Push(r *git.Repo, f forge.Forge, s *Stack, o PushOptions) error {
 	if o.Log == nil {
 		o.Log = io.Discard
@@ -199,16 +200,25 @@ func Push(r *git.Repo, f forge.Forge, s *Stack, o PushOptions) error {
 		} else {
 			b.PR = existing.Number
 			if existing.BaseRef != b.Parent {
-				base := b.Parent
-				if err := f.EditPR(existing.Number, &base, nil); err != nil {
-					return err
+				// In a GitHub stack the bases are GitHub's: it retargets
+				// the PRs above a merge itself and refuses base changes.
+				if n, err := f.StackOf(existing.Number); err == nil && n != 0 {
+					fmt.Fprintf(o.Log, "- #%d targets %s, not %s; GitHub stack %d sets its base, so stackq leaves it\n", existing.Number, existing.BaseRef, b.Parent, n)
+				} else {
+					base := b.Parent
+					if err := f.EditPR(existing.Number, &base, nil); err != nil {
+						return err
+					}
+					fmt.Fprintf(o.Log, "~ retargeted #%d → %s\n", existing.Number, b.Parent)
 				}
-				fmt.Fprintf(o.Log, "~ retargeted #%d → %s\n", existing.Number, b.Parent)
 			}
 		}
 		if err := s.Save(r); err != nil {
 			return err
 		}
+	}
+	if err := LinkGitHubStack(f, s, o.Log); err != nil {
+		return err
 	}
 	for _, b := range s.Active() {
 		pr, err := f.GetPR(b.PR)
@@ -278,9 +288,9 @@ func stripBlock(body string) string {
 func linkSource(r *git.Repo, f forge.Forge, s *Stack, src forge.PR, o PushOptions) error {
 	if !s.SourceNotified {
 		var b strings.Builder
-		how := "They land in order through the merge queue"
+		how := "They are a GitHub stack and land in order, bottom up"
 		if s.Landing == Atomic {
-			how = "Each is reviewed on its own; they land together as one merge-queue entry"
+			how = "They are a GitHub stack: each is reviewed on its own, and they land together, bottom up, as one merge"
 		}
 		fmt.Fprintf(&b, "📚 This PR was split into a stack of %d smaller PRs (stack `%s`). %s:\n\n", len(s.Branches), s.Name, how)
 		for i, br := range s.Branches {
@@ -354,4 +364,76 @@ func markMergedByPR(r *git.Repo, s *Stack, f forge.Forge, log io.Writer) {
 			fmt.Fprintf(log, "✓ %s has landed inside #%d\n", b.Name, s.Branches[landedAt].PR)
 		}
 	}
+}
+
+// LinkGitHubStack makes the stack's open PRs, bottom first, one GitHub stack:
+// it creates the stack, or adds PRs that were opened since on top of the one
+// that exists. GitHub then shows the stack on every PR, runs trunk's rules and
+// CI for each of them, merges them bottom up as one request, and rebases and
+// retargets the PRs above a merge by itself. A stack of one open PR is not
+// linked: GitHub stacks need two.
+func LinkGitHubStack(f forge.Forge, s *Stack, log io.Writer) error {
+	var open []int
+	for _, b := range s.Branches {
+		if !b.Merged && b.PR > 0 {
+			open = append(open, b.PR)
+		}
+	}
+	if len(open) < 2 {
+		return nil
+	}
+	in := map[int]int{} // PR -> GitHub stack
+	stacks := map[int]bool{}
+	for _, n := range open {
+		st, err := f.StackOf(n)
+		if err != nil {
+			return fmt.Errorf("could not read the GitHub stack of #%d: %w", n, err)
+		}
+		if st != 0 {
+			in[n], stacks[st] = st, true
+		}
+	}
+	switch len(stacks) {
+	case 0:
+		st, err := f.CreateStack(open)
+		if err != nil {
+			return fmt.Errorf("could not link %s as a GitHub stack: %w\nThe PRs exist; fix the cause and run stackq push again", prList(open), err)
+		}
+		fmt.Fprintf(log, "⧉ linked %s as GitHub stack %d\n", prList(open), st)
+		return nil
+	case 1:
+	default:
+		return fmt.Errorf("the PRs of stack %s are in more than one GitHub stack; unstack them on GitHub and run stackq push again", s.Name)
+	}
+	var st int
+	for n := range stacks {
+		st = n
+	}
+	// PRs already linked must be the bottom ones; new ones go on top.
+	var missing []int
+	for _, n := range open {
+		if in[n] == 0 {
+			missing = append(missing, n)
+			continue
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("#%d is in GitHub stack %d but %s below it is not; unstack on GitHub and run stackq push again", n, st, prList(missing))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	if err := f.AddToStack(st, missing); err != nil {
+		return fmt.Errorf("could not add %s to GitHub stack %d: %w", prList(missing), st, err)
+	}
+	fmt.Fprintf(log, "⧉ added %s to GitHub stack %d\n", prList(missing), st)
+	return nil
+}
+
+func prList(prs []int) string {
+	var out []string
+	for _, n := range prs {
+		out = append(out, fmt.Sprintf("#%d", n))
+	}
+	return strings.Join(out, ", ")
 }
